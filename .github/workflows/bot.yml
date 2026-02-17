@@ -3,13 +3,17 @@ name: GoFile Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 0/5 * * *'
-    - cron: '30 2/5 * * *'
+    - cron: '0 */5 * * *'
+
+# Same workflow already running නම් cancel කරනවා
+concurrency:
+  group: gofile-bot
+  cancel-in-progress: true
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 299
+    timeout-minutes: 350
 
     steps:
       - uses: actions/checkout@v4
@@ -32,4 +36,5 @@ jobs:
           TG_PHONE: ${{ secrets.TG_PHONE }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           OWNER_ID: ${{ secrets.OWNER_ID }}
+          STRING_SESSION: ${{ secrets.STRING_SESSION }}
         run: python bot.py
