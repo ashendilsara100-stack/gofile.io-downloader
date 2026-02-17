@@ -21,21 +21,18 @@ OWNER_ID   = int(os.environ["OWNER_ID"])
 USER_PHONE = os.environ["TG_PHONE"]
 
 # ── Config ─────────────────────────────────────────────────────────────────
-PART_SIZE      = 1990 * 1024 * 1024   # 1990 MB per split part
-UPLOAD_CHUNK   = 256 * 1024           # 256 KB per chunk (safe for Telegram)
-PARALLEL       = 8                    # එකවර 8 chunks — maximum speed
-UA             = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-WORK_DIR       = "/tmp/gofile_downloads"
+PART_SIZE    = 1990 * 1024 * 1024   # 1990 MB per split part
+UPLOAD_CHUNK = 256 * 1024           # 256 KB per chunk
+PARALLEL     = 6                    # concurrent chunks (single connection safe)
+UA           = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+WORK_DIR     = "/tmp/gofile_downloads"
 
 os.makedirs(WORK_DIR, exist_ok=True)
 
-# ── Clients ────────────────────────────────────────────────────────────────
-# Parallel upload සඳහා multiple connections use කරනවා
-user_clients = [TelegramClient(f"user_session", API_ID, API_HASH)]
-for i in range(1, PARALLEL):
-    user_clients.append(TelegramClient(f"user_session_{i}", API_ID, API_HASH))
-
-bot_client = TelegramClient("bot_session", API_ID, API_HASH)
+# ── Single clients — session file reuse ───────────────────────────────────
+# Extra auth ඉල්ලන්නේ නෑ — same user_session.session file use කරනවා
+user_client = TelegramClient("user_session", API_ID, API_HASH)
+bot_client  = TelegramClient("bot_session",  API_ID, API_HASH)
 
 
 # ════════════════════════════════════════
@@ -103,7 +100,7 @@ def make_bar(pct: int, length: int = 12) -> str:
 
 
 # ════════════════════════════════════════
-# Download (streaming)
+# Download
 # ════════════════════════════════════════
 
 async def download_file(url: str, filename: str, headers: dict,
@@ -160,76 +157,61 @@ def split_file(path: str) -> list:
 
 
 # ════════════════════════════════════════
-# Parallel upload — MAXIMUM SPEED
+# Parallel upload — single connection, async semaphore
 # ════════════════════════════════════════
 
 async def upload_large_file_parallel(file_path: str, status_cb=None,
                                       part_num: int = 1,
                                       total_parts: int = 1) -> InputFileBig:
     """
-    PARALLEL chunk upload:
-    File eka chunks walata divide කරලා
-    PARALLEL connections ලා simultaneously upload කරනවා.
-    Sequential upload than ~4-6x fast.
+    Single Telegram connection ලා async parallel chunks upload.
+    Multiple connections phone auth ඉල්ලනවා — ඒ avoid කරලා
+    asyncio.gather ෙකෙ concurrent SaveBigFilePartRequest calls.
     """
     file_size    = os.path.getsize(file_path)
     file_id      = random.randint(0, 2**63)
     total_chunks = math.ceil(file_size / UPLOAD_CHUNK)
 
-    # Shared progress counter
-    uploaded_chunks = [0]
-    lock = asyncio.Lock()
+    uploaded = [0]  # shared counter
+    sem      = asyncio.Semaphore(PARALLEL)
 
-    async def upload_chunk(chunk_idx: int, data: bytes, client: TelegramClient):
-        """Single chunk upload — retry logic සහිතව"""
-        for attempt in range(3):
-            try:
-                await client(SaveBigFilePartRequest(
-                    file_id=file_id,
-                    file_part=chunk_idx,
-                    file_total_parts=total_chunks,
-                    bytes=data,
-                ))
-                async with lock:
-                    uploaded_chunks[0] += 1
-                    done = uploaded_chunks[0]
+    async def upload_one(idx: int, data: bytes):
+        async with sem:
+            for attempt in range(3):
+                try:
+                    await user_client(SaveBigFilePartRequest(
+                        file_id=file_id,
+                        file_part=idx,
+                        file_total_parts=total_chunks,
+                        bytes=data,
+                    ))
+                    uploaded[0] += 1
+                    done = uploaded[0]
+                    # Every 5% update status
                     if status_cb and done % max(1, total_chunks // 20) == 0:
-                        pct  = int(done / total_chunks * 100)
+                        pct     = int(done / total_chunks * 100)
                         done_mb = min(done * UPLOAD_CHUNK, file_size) // (1024**2)
-                        total_mb = file_size // (1024**2)
+                        tot_mb  = file_size // (1024**2)
                         await status_cb(
                             f"⬆️ **Uploading part {part_num}/{total_parts}**\n\n"
                             f"{make_bar(pct)} {pct}%\n"
-                            f"📤 {done_mb} MB / {total_mb} MB\n"
-                            f"⚡ {PARALLEL} parallel connections"
+                            f"📤 {done_mb} MB / {tot_mb} MB\n"
+                            f"⚡ {PARALLEL} concurrent chunks"
                         )
-                return
-            except Exception as e:
-                if attempt == 2:
-                    raise e
-                await asyncio.sleep(1)
+                    return
+                except Exception as e:
+                    if attempt == 2:
+                        raise e
+                    await asyncio.sleep(2 ** attempt)
 
-    # File eka read කරලා chunks list හදනවා
-    chunks = []
+    # Chunks read කරලා tasks හදනවා
+    tasks = []
     with open(file_path, "rb") as f:
         for i in range(total_chunks):
             data = f.read(UPLOAD_CHUNK)
             if not data:
                 break
-            chunks.append((i, data))
-
-    # Semaphore ලා PARALLEL limit enforce කරනවා
-    semaphore = asyncio.Semaphore(PARALLEL)
-
-    async def bounded_upload(chunk_idx: int, data: bytes, client: TelegramClient):
-        async with semaphore:
-            await upload_chunk(chunk_idx, data, client)
-
-    # සියලු chunks parallel ලා upload
-    tasks = []
-    for i, (chunk_idx, data) in enumerate(chunks):
-        client = user_clients[i % len(user_clients)]
-        tasks.append(bounded_upload(chunk_idx, data, client))
+            tasks.append(upload_one(i, data))
 
     await asyncio.gather(*tasks)
 
@@ -243,21 +225,21 @@ async def upload_large_file_parallel(file_path: str, status_cb=None,
 async def upload_parts(parts: list, original_name: str, status_cb=None):
     total = len(parts)
     for i, p in enumerate(parts, 1):
-        fname    = os.path.basename(p)
-        size_mb  = os.path.getsize(p) // (1024**2)
-        caption  = f"📦 {original_name}\n🗂 Part {i}/{total}"
+        fname   = os.path.basename(p)
+        size_mb = os.path.getsize(p) // (1024**2)
+        caption = f"📦 {original_name}\n🗂 Part {i}/{total}"
 
         if status_cb:
             await status_cb(
                 f"⬆️ **Uploading part {i}/{total}**\n\n"
                 f"{make_bar(0)} 0%\n"
                 f"📤 0 MB / {size_mb} MB\n"
-                f"⚡ {PARALLEL} parallel connections"
+                f"⚡ {PARALLEL} concurrent chunks"
             )
 
         input_file = await upload_large_file_parallel(p, status_cb, i, total)
 
-        await user_clients[0](SendMediaRequest(
+        await user_client(SendMediaRequest(
             peer="me",
             media=InputMediaUploadedDocument(
                 file=input_file,
@@ -301,9 +283,7 @@ async def start_handler(event):
             Button.inline("📖 How to Use", b"howto"),
             Button.url("👨‍💻 Developer", "https://t.me/ashencode"),
         ],
-        [
-            Button.inline("ℹ️ About", b"about"),
-        ],
+        [Button.inline("ℹ️ About", b"about")],
     ]
     await event.respond(
         "╔═══════════════════════╗\n"
@@ -330,10 +310,8 @@ async def howto_handler(event):
         "**3️⃣** Bot auto:\n"
         "       ⬇️ Download\n"
         "       ✂️ 2GB parts walata split\n"
-        "       ⬆️ Parallel upload → Saved Messages\n\n"
-        "**4️⃣** Done! ✅\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚡ {PARALLEL}x parallel upload connections!",
+        f"       ⬆️ {PARALLEL}x parallel upload\n\n"
+        "**4️⃣** Done! ✅",
         buttons=[[Button.inline("🔙 Back", b"back")]],
     )
 
@@ -348,7 +326,7 @@ async def about_handler(event):
         "✅ 2GB parts support\n"
         "✅ Live progress bar\n"
         f"✅ {PARALLEL}x parallel upload\n"
-        "✅ Auto retry on error\n\n"
+        "✅ Auto retry (3x)\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "👨‍💻 Dev: @ashencode",
         buttons=[[Button.inline("🔙 Back", b"back")]],
@@ -398,9 +376,7 @@ async def gofile_handler(event):
 
         await upload_parts(parts, fname, update_status)
 
-        total_size = sum(
-            os.path.getsize(p) for p in parts if os.path.exists(p)
-        )
+        total_size = sum(os.path.getsize(p) for p in parts if os.path.exists(p))
         await update_status(
             f"🎉 **Done!**\n\n"
             f"📦 `{fname}`\n"
@@ -422,19 +398,14 @@ async def gofile_handler(event):
 # ════════════════════════════════════════
 
 async def main():
-    # Primary user client start (phone auth)
-    await user_clients[0].start(phone=USER_PHONE)
-    print("[✓] Primary user client connected.")
-
-    # Additional parallel clients — same session reuse
-    for i, c in enumerate(user_clients[1:], 1):
-        await c.start(phone=USER_PHONE)
-        print(f"[✓] Parallel client {i} connected.")
+    # Single user client — same session file, no extra auth
+    await user_client.start(phone=USER_PHONE)
+    print("[✓] User client connected.")
 
     await bot_client.start(bot_token=BOT_TOKEN)
     me = await bot_client.get_me()
     print(f"[✓] Bot started: @{me.username}")
-    print(f"[*] Parallel upload: {PARALLEL} connections")
+    print(f"[*] Parallel chunks: {PARALLEL}")
     print("[*] Waiting for GoFile links...")
 
     await bot_client.run_until_disconnected()
