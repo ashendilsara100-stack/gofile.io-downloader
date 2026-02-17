@@ -13,7 +13,7 @@ from telethon.tl.types import (
     DocumentAttributeFilename,
 )
 
-# ── ENV variables ──────────────────────────────────────────────────────────
+# ── ENV ────────────────────────────────────────────────────────────────────
 API_ID     = int(os.environ["TG_API_ID"])
 API_HASH   = os.environ["TG_API_HASH"]
 BOT_TOKEN  = os.environ["BOT_TOKEN"]
@@ -21,15 +21,21 @@ OWNER_ID   = int(os.environ["OWNER_ID"])
 USER_PHONE = os.environ["TG_PHONE"]
 
 # ── Config ─────────────────────────────────────────────────────────────────
-PART_SIZE    = 1990 * 1024 * 1024   # 1990 MB per part
-UPLOAD_CHUNK = 2048 * 1024          # 2 MB chunks (faster upload)
-UA           = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-WORK_DIR     = "/tmp/gofile_downloads"
+PART_SIZE      = 1990 * 1024 * 1024   # 1990 MB per split part
+UPLOAD_CHUNK   = 256 * 1024           # 256 KB per chunk (safe for Telegram)
+PARALLEL       = 8                    # එකවර 8 chunks — maximum speed
+UA             = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+WORK_DIR       = "/tmp/gofile_downloads"
 
 os.makedirs(WORK_DIR, exist_ok=True)
 
-bot_client  = TelegramClient("bot_session",  API_ID, API_HASH)
-user_client = TelegramClient("user_session", API_ID, API_HASH)
+# ── Clients ────────────────────────────────────────────────────────────────
+# Parallel upload සඳහා multiple connections use කරනවා
+user_clients = [TelegramClient(f"user_session", API_ID, API_HASH)]
+for i in range(1, PARALLEL):
+    user_clients.append(TelegramClient(f"user_session_{i}", API_ID, API_HASH))
+
+bot_client = TelegramClient("bot_session", API_ID, API_HASH)
 
 
 # ════════════════════════════════════════
@@ -57,7 +63,6 @@ def get_website_token() -> str:
 
 def resolve_gofile(page_url: str):
     content_id = page_url.rstrip("/").split("/d/")[-1]
-
     r = requests.post(
         "https://api.gofile.io/accounts",
         headers={"User-Agent": UA}, timeout=15
@@ -65,7 +70,6 @@ def resolve_gofile(page_url: str):
     if r.get("status") != "ok":
         raise Exception(f"Guest token fail: {r}")
     guest_token = r["data"]["token"]
-
     wt = get_website_token()
     hdrs = {
         "Authorization": f"Bearer {guest_token}",
@@ -76,10 +80,8 @@ def resolve_gofile(page_url: str):
         f"https://api.gofile.io/contents/{content_id}?cache=true",
         headers=hdrs, timeout=30
     ).json()
-
     if resp.get("status") != "ok":
         raise Exception(f"GoFile API: {resp.get('status')}")
-
     data     = resp["data"]
     children = data.get("children", {})
     item     = next((v for v in children.values() if v.get("type") == "file"), None)
@@ -88,22 +90,20 @@ def resolve_gofile(page_url: str):
             item = data
         else:
             raise Exception("File nemata.")
-
     return item["link"], item["name"], item.get("size", 0), hdrs
 
 
 # ════════════════════════════════════════
-# Progress bar helper
+# Progress bar
 # ════════════════════════════════════════
 
-def make_progress_bar(pct: int, length: int = 12) -> str:
+def make_bar(pct: int, length: int = 12) -> str:
     filled = int(length * pct / 100)
-    bar    = "█" * filled + "░" * (length - filled)
-    return f"[{bar}]"
+    return "[" + "█" * filled + "░" * (length - filled) + "]"
 
 
 # ════════════════════════════════════════
-# Download
+# Download (streaming)
 # ════════════════════════════════════════
 
 async def download_file(url: str, filename: str, headers: dict,
@@ -123,10 +123,9 @@ async def download_file(url: str, filename: str, headers: dict,
                         pct = int(done / total * 100)
                         if pct - last_pct >= 5:
                             last_pct = pct
-                            bar = make_progress_bar(pct)
                             await status_cb(
                                 f"⬇️ **Downloading...**\n\n"
-                                f"{bar} {pct}%\n"
+                                f"{make_bar(pct)} {pct}%\n"
                                 f"📦 {done//(1024**2)} MB / {total//(1024**2)} MB"
                             )
     return path
@@ -141,7 +140,6 @@ def split_file(path: str) -> list:
     n    = math.ceil(size / PART_SIZE)
     if n == 1:
         return [path]
-
     parts = []
     with open(path, "rb") as f:
         for i in range(n):
@@ -162,40 +160,78 @@ def split_file(path: str) -> list:
 
 
 # ════════════════════════════════════════
-# Upload — live MB progress
+# Parallel upload — MAXIMUM SPEED
 # ════════════════════════════════════════
 
-async def upload_large_file(file_path: str, status_cb=None,
-                             part_idx: int = 1, total_parts: int = 1) -> InputFileBig:
-    file_size      = os.path.getsize(file_path)
-    file_id        = random.randint(0, 2**63)
-    total_chunks   = math.ceil(file_size / UPLOAD_CHUNK)
-    uploaded_bytes = 0
-    last_pct       = -10
+async def upload_large_file_parallel(file_path: str, status_cb=None,
+                                      part_num: int = 1,
+                                      total_parts: int = 1) -> InputFileBig:
+    """
+    PARALLEL chunk upload:
+    File eka chunks walata divide කරලා
+    PARALLEL connections ලා simultaneously upload කරනවා.
+    Sequential upload than ~4-6x fast.
+    """
+    file_size    = os.path.getsize(file_path)
+    file_id      = random.randint(0, 2**63)
+    total_chunks = math.ceil(file_size / UPLOAD_CHUNK)
 
+    # Shared progress counter
+    uploaded_chunks = [0]
+    lock = asyncio.Lock()
+
+    async def upload_chunk(chunk_idx: int, data: bytes, client: TelegramClient):
+        """Single chunk upload — retry logic සහිතව"""
+        for attempt in range(3):
+            try:
+                await client(SaveBigFilePartRequest(
+                    file_id=file_id,
+                    file_part=chunk_idx,
+                    file_total_parts=total_chunks,
+                    bytes=data,
+                ))
+                async with lock:
+                    uploaded_chunks[0] += 1
+                    done = uploaded_chunks[0]
+                    if status_cb and done % max(1, total_chunks // 20) == 0:
+                        pct  = int(done / total_chunks * 100)
+                        done_mb = min(done * UPLOAD_CHUNK, file_size) // (1024**2)
+                        total_mb = file_size // (1024**2)
+                        await status_cb(
+                            f"⬆️ **Uploading part {part_num}/{total_parts}**\n\n"
+                            f"{make_bar(pct)} {pct}%\n"
+                            f"📤 {done_mb} MB / {total_mb} MB\n"
+                            f"⚡ {PARALLEL} parallel connections"
+                        )
+                return
+            except Exception as e:
+                if attempt == 2:
+                    raise e
+                await asyncio.sleep(1)
+
+    # File eka read කරලා chunks list හදනවා
+    chunks = []
     with open(file_path, "rb") as f:
-        for idx in range(total_chunks):
-            chunk = f.read(UPLOAD_CHUNK)
-            if not chunk:
+        for i in range(total_chunks):
+            data = f.read(UPLOAD_CHUNK)
+            if not data:
                 break
-            await user_client(SaveBigFilePartRequest(
-                file_id=file_id,
-                file_part=idx,
-                file_total_parts=total_chunks,
-                bytes=chunk,
-            ))
-            uploaded_bytes += len(chunk)
+            chunks.append((i, data))
 
-            if status_cb:
-                pct = int(uploaded_bytes / file_size * 100)
-                if pct - last_pct >= 5:
-                    last_pct = pct
-                    bar = make_progress_bar(pct)
-                    await status_cb(
-                        f"⬆️ **Uploading part {part_idx}/{total_parts}**\n\n"
-                        f"{bar} {pct}%\n"
-                        f"📤 {uploaded_bytes//(1024**2)} MB / {file_size//(1024**2)} MB"
-                    )
+    # Semaphore ලා PARALLEL limit enforce කරනවා
+    semaphore = asyncio.Semaphore(PARALLEL)
+
+    async def bounded_upload(chunk_idx: int, data: bytes, client: TelegramClient):
+        async with semaphore:
+            await upload_chunk(chunk_idx, data, client)
+
+    # සියලු chunks parallel ලා upload
+    tasks = []
+    for i, (chunk_idx, data) in enumerate(chunks):
+        client = user_clients[i % len(user_clients)]
+        tasks.append(bounded_upload(chunk_idx, data, client))
+
+    await asyncio.gather(*tasks)
 
     return InputFileBig(
         id=file_id,
@@ -207,20 +243,21 @@ async def upload_large_file(file_path: str, status_cb=None,
 async def upload_parts(parts: list, original_name: str, status_cb=None):
     total = len(parts)
     for i, p in enumerate(parts, 1):
-        fname   = os.path.basename(p)
-        size_mb = os.path.getsize(p) // (1024 ** 2)
-        caption = f"📦 {original_name}\n🗂 Part {i}/{total}"
+        fname    = os.path.basename(p)
+        size_mb  = os.path.getsize(p) // (1024**2)
+        caption  = f"📦 {original_name}\n🗂 Part {i}/{total}"
 
         if status_cb:
             await status_cb(
                 f"⬆️ **Uploading part {i}/{total}**\n\n"
-                f"{make_progress_bar(0)} 0%\n"
-                f"📤 0 MB / {size_mb} MB"
+                f"{make_bar(0)} 0%\n"
+                f"📤 0 MB / {size_mb} MB\n"
+                f"⚡ {PARALLEL} parallel connections"
             )
 
-        input_file = await upload_large_file(p, status_cb, i, total)
+        input_file = await upload_large_file_parallel(p, status_cb, i, total)
 
-        await user_client(SendMediaRequest(
+        await user_clients[0](SendMediaRequest(
             peer="me",
             media=InputMediaUploadedDocument(
                 file=input_file,
@@ -232,7 +269,7 @@ async def upload_parts(parts: list, original_name: str, status_cb=None):
         ))
 
         if status_cb:
-            await status_cb(f"✅ **Part {i}/{total} uploaded!**\n📦 {fname}")
+            await status_cb(f"✅ **Part {i}/{total} done!**\n📦 {fname}")
 
 
 # ════════════════════════════════════════
@@ -293,10 +330,10 @@ async def howto_handler(event):
         "**3️⃣** Bot auto:\n"
         "       ⬇️ Download\n"
         "       ✂️ 2GB parts walata split\n"
-        "       ⬆️ Saved Messages upload\n\n"
+        "       ⬆️ Parallel upload → Saved Messages\n\n"
         "**4️⃣** Done! ✅\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "💡 Progress live ලා පෙනෙනවා!",
+        f"⚡ {PARALLEL}x parallel upload connections!",
         buttons=[[Button.inline("🔙 Back", b"back")]],
     )
 
@@ -310,7 +347,8 @@ async def about_handler(event):
         "✅ GoFile auto download\n"
         "✅ 2GB parts support\n"
         "✅ Live progress bar\n"
-        "✅ Fast upload\n\n"
+        f"✅ {PARALLEL}x parallel upload\n"
+        "✅ Auto retry on error\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "👨‍💻 Dev: @ashencode",
         buttons=[[Button.inline("🔙 Back", b"back")]],
@@ -349,7 +387,7 @@ async def gofile_handler(event):
         await update_status(
             f"📄 **{fname}**\n"
             f"💾 Size: {size//(1024**2)} MB\n\n"
-            f"{make_progress_bar(0)} 0%\n"
+            f"{make_bar(0)} 0%\n"
             f"⬇️ Starting download..."
         )
 
@@ -360,7 +398,9 @@ async def gofile_handler(event):
 
         await upload_parts(parts, fname, update_status)
 
-        total_size = sum(os.path.getsize(p) for p in parts if os.path.exists(p))
+        total_size = sum(
+            os.path.getsize(p) for p in parts if os.path.exists(p)
+        )
         await update_status(
             f"🎉 **Done!**\n\n"
             f"📦 `{fname}`\n"
@@ -382,12 +422,19 @@ async def gofile_handler(event):
 # ════════════════════════════════════════
 
 async def main():
-    await user_client.start(phone=USER_PHONE)
-    print("[✓] User client connected.")
+    # Primary user client start (phone auth)
+    await user_clients[0].start(phone=USER_PHONE)
+    print("[✓] Primary user client connected.")
+
+    # Additional parallel clients — same session reuse
+    for i, c in enumerate(user_clients[1:], 1):
+        await c.start(phone=USER_PHONE)
+        print(f"[✓] Parallel client {i} connected.")
 
     await bot_client.start(bot_token=BOT_TOKEN)
     me = await bot_client.get_me()
     print(f"[✓] Bot started: @{me.username}")
+    print(f"[*] Parallel upload: {PARALLEL} connections")
     print("[*] Waiting for GoFile links...")
 
     await bot_client.run_until_disconnected()
