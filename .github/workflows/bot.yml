@@ -1,0 +1,35 @@
+name: GoFile Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0/5 * * *'
+    - cron: '30 2/5 * * *'
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 299
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write session file
+        run: echo "${{ secrets.SESSION_FILE }}" | base64 -d > user_session.session
+
+      - name: Run Bot
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_PHONE: ${{ secrets.TG_PHONE }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+        run: python bot.py
