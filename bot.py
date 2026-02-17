@@ -19,32 +19,29 @@ API_ID         = int(os.environ["TG_API_ID"])
 API_HASH       = os.environ["TG_API_HASH"]
 BOT_TOKEN      = os.environ["BOT_TOKEN"]
 OWNER_ID       = int(os.environ["OWNER_ID"])
-STRING_SESSION = os.environ.get("STRING_SESSION") # Aluth variable eka
+STRING_SESSION = os.environ.get("STRING_SESSION")
 
 # ── Config ─────────────────────────────────────────────────────────────────
 PART_SIZE    = 1990 * 1024 * 1024   # 1990 MB per split part
-UPLOAD_CHUNK = 256 * 1024           # 256 KB per chunk
-PARALLEL     = 8                    # 8 parallel connections
+UPLOAD_CHUNK = 512 * 1024           # 512 KB (More stable for Big Files)
+PARALLEL     = 8                    
 UA           = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 WORK_DIR     = "/tmp/gofile_downloads"
 
 os.makedirs(WORK_DIR, exist_ok=True)
 
 # ── Clients ────────────────────────────────────────────────────────────────
-# String Session eka use karala parallel clients hadanawa
 user_clients = []
 if STRING_SESSION:
     for i in range(PARALLEL):
-        # Ekama string session eka use karala multiple connections hadanawa
         user_clients.append(TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH))
 else:
-    # Local run karanawa nam thama meka ona wenne
     user_clients.append(TelegramClient("user_session", API_ID, API_HASH))
 
 bot_client = TelegramClient("bot_session", API_ID, API_HASH)
 
 # ════════════════════════════════════════
-# GoFile helpers (Oyaage original eka)
+# GoFile helpers
 # ════════════════════════════════════════
 
 def get_website_token() -> str:
@@ -76,7 +73,7 @@ def resolve_gofile(page_url: str):
     return item["link"], item["name"], item.get("size", 0), hdrs
 
 # ════════════════════════════════════════
-# Progress, Download, Split & Upload (Oyaage original logically unchanged)
+# Progress & Helpers
 # ════════════════════════════════════════
 
 def make_bar(pct: int, length: int = 12) -> str:
@@ -105,7 +102,7 @@ async def download_file(url: str, filename: str, headers: dict, status_cb=None) 
 def split_file(path: str) -> list:
     size = os.path.getsize(path)
     n = math.ceil(size / PART_SIZE)
-    if n == 1: return [path]
+    if n <= 1: return [path]
     parts = []
     with open(path, "rb") as f:
         for i in range(n):
@@ -121,40 +118,50 @@ def split_file(path: str) -> list:
                 parts.append(pname)
     return parts
 
+# ════════════════════════════════════════
+# Upload Parallel (Fixed Total Chunks Logic)
+# ════════════════════════════════════════
+
 async def upload_large_file_parallel(file_path: str, status_cb=None, part_num: int = 1, total_parts: int = 1) -> InputFileBig:
     file_size = os.path.getsize(file_path)
     file_id = random.randint(0, 2**63)
-    total_chunks = math.ceil(file_size / UPLOAD_CHUNK)
+    # Important: Chunk ganana calculate karana widiya wenas kala
+    total_chunks = (file_size + UPLOAD_CHUNK - 1) // UPLOAD_CHUNK
+    
     uploaded_chunks = [0]
     lock = asyncio.Lock()
 
     async def upload_chunk(chunk_idx: int, data: bytes, client: TelegramClient):
         for attempt in range(3):
             try:
-                await client(SaveBigFilePartRequest(file_id=file_id, file_part=chunk_idx, file_total_parts=total_chunks, bytes=data))
+                await client(SaveBigFilePartRequest(
+                    file_id=file_id, 
+                    file_part=chunk_idx, 
+                    file_total_parts=total_chunks, 
+                    bytes=data
+                ))
                 async with lock:
                     uploaded_chunks[0] += 1
                     done = uploaded_chunks[0]
-                    if status_cb and done % max(1, total_chunks // 20) == 0:
+                    if status_cb and done % max(1, total_chunks // 15) == 0:
                         pct = int(done / total_chunks * 100)
-                        await status_cb(f"⬆️ **Uploading part {part_num}/{total_parts}**\n\n{make_bar(pct)} {pct}%\n📤 {min(done * UPLOAD_CHUNK, file_size)//(1024**2)} MB / {file_size//(1024**2)} MB\n⚡ Parallel: {PARALLEL}")
+                        await status_cb(f"⬆️ **Uploading part {part_num}/{total_parts}**\n\n{make_bar(pct)} {pct}%\n📤 {min(done * UPLOAD_CHUNK, file_size)//(1024**2)} MB / {file_size//(1024**2)} MB")
                 return
             except Exception as e:
                 if attempt == 2: raise e
-                await asyncio.sleep(1)
-
-    chunks = []
-    with open(file_path, "rb") as f:
-        for i in range(total_chunks):
-            data = f.read(UPLOAD_CHUNK)
-            if not data: break
-            chunks.append((i, data))
+                await asyncio.sleep(2)
 
     semaphore = asyncio.Semaphore(PARALLEL)
     async def bounded_upload(chunk_idx: int, data: bytes, client: TelegramClient):
         async with semaphore: await upload_chunk(chunk_idx, data, client)
 
-    tasks = [bounded_upload(c_idx, c_data, user_clients[i % len(user_clients)]) for i, (c_idx, c_data) in enumerate(chunks)]
+    tasks = []
+    with open(file_path, "rb") as f:
+        for i in range(total_chunks):
+            data = f.read(UPLOAD_CHUNK)
+            if not data: break
+            tasks.append(bounded_upload(i, data, user_clients[i % len(user_clients)]))
+
     await asyncio.gather(*tasks)
     return InputFileBig(id=file_id, parts=total_chunks, name=os.path.basename(file_path))
 
@@ -180,20 +187,19 @@ def cleanup(original: str, parts: list):
         except: pass
 
 # ════════════════════════════════════════
-# Bot Handlers & Main
+# Handlers
 # ════════════════════════════════════════
 
 active_jobs = {}
 
 @bot_client.on(events.NewMessage(pattern="/start"))
 async def start_handler(event):
-    await event.respond("📦 **GoFile Downloader**\n\nLink yawanna:\n`https://gofile.io/d/XXXXXX`", 
-                        buttons=[[Button.url("Dev", "https://t.me/ashencode")]])
+    await event.respond("📦 **GoFile Downloader Online!**\n\nSend a link to start.")
 
 @bot_client.on(events.NewMessage(pattern=r"https://gofile\.io/d/\S+"))
 async def gofile_handler(event):
     chat_id = event.chat_id
-    if active_jobs.get(chat_id): return await event.respond("⏳ Job running...")
+    if active_jobs.get(chat_id): return await event.respond("⏳ Please wait for current job.")
     active_jobs[chat_id] = True
     url = event.pattern_match.group(0).strip()
     status_msg = await event.respond(f"🔍 Processing...")
@@ -209,7 +215,7 @@ async def gofile_handler(event):
         original_file = await download_file(dl_url, fname, hdrs, update_status)
         parts = split_file(original_file)
         await upload_parts(parts, fname, update_status)
-        await update_status(f"✅ **Done!**\n📦 `{fname}` upload kala.")
+        await update_status(f"✅ **Done!** Check your Saved Messages.")
     except Exception as e:
         await update_status(f"❌ **Error:**\n`{e}`")
     finally:
@@ -217,15 +223,13 @@ async def gofile_handler(event):
         active_jobs.pop(chat_id, None)
 
 async def main():
-    # User clients connect using String Session
-    print("[*] Connecting User Clients...")
+    print("[*] Starting User Clients...")
     for i, client in enumerate(user_clients):
         await client.start()
-        print(f"[✓] User Client {i} connected.")
-
+    
     await bot_client.start(bot_token=BOT_TOKEN)
     me = await bot_client.get_me()
-    print(f"[✓] Bot started: @{me.username}")
+    print(f"[✓] Bot @{me.username} is running!")
     await bot_client.run_until_disconnected()
 
 if __name__ == "__main__":
