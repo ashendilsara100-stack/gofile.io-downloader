@@ -22,11 +22,12 @@ OWNER_ID       = int(os.environ["OWNER_ID"])
 STRING_SESSION = os.environ.get("STRING_SESSION")
 
 # ── Config ─────────────────────────────────────────────────────────────────
-PART_SIZE    = 1990 * 1024 * 1024   # 1990 MB per split part
-UPLOAD_CHUNK = 512 * 1024           # 512 KB (More stable for Big Files)
-PARALLEL     = 8                    
-UA           = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-WORK_DIR     = "/tmp/gofile_downloads"
+PART_SIZE      = 1990 * 1024 * 1024
+UPLOAD_CHUNK   = 512 * 1024
+PARALLEL       = 8
+MAX_JOBS       = 3              # එකවර maximum jobs 3ක්
+UA             = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+WORK_DIR       = "/tmp/gofile_downloads"
 
 os.makedirs(WORK_DIR, exist_ok=True)
 
@@ -39,6 +40,11 @@ else:
     user_clients.append(TelegramClient("user_session", API_ID, API_HASH))
 
 bot_client = TelegramClient("bot_session", API_ID, API_HASH)
+
+# ── Queue system ───────────────────────────────────────────────────────────
+job_semaphore = asyncio.Semaphore(MAX_JOBS)  # max 3 jobs at once
+active_urls   = set()                         # duplicate prevent
+
 
 # ════════════════════════════════════════
 # GoFile helpers
@@ -72,13 +78,19 @@ def resolve_gofile(page_url: str):
         else: raise Exception("File nemata.")
     return item["link"], item["name"], item.get("size", 0), hdrs
 
+
 # ════════════════════════════════════════
-# Progress & Helpers
+# Progress bar
 # ════════════════════════════════════════
 
 def make_bar(pct: int, length: int = 12) -> str:
     filled = int(length * pct / 100)
     return "[" + "█" * filled + "░" * (length - filled) + "]"
+
+
+# ════════════════════════════════════════
+# Download
+# ════════════════════════════════════════
 
 async def download_file(url: str, filename: str, headers: dict, status_cb=None) -> str:
     path = os.path.join(WORK_DIR, filename)
@@ -96,8 +108,17 @@ async def download_file(url: str, filename: str, headers: dict, status_cb=None) 
                         pct = int(done / total * 100)
                         if pct - last_pct >= 5:
                             last_pct = pct
-                            await status_cb(f"⬇️ **Downloading...**\n\n{make_bar(pct)} {pct}%\n📦 {done//(1024**2)} MB / {total//(1024**2)} MB")
+                            await status_cb(
+                                f"⬇️ **Downloading...**\n\n"
+                                f"{make_bar(pct)} {pct}%\n"
+                                f"📦 {done//(1024**2)} MB / {total//(1024**2)} MB"
+                            )
     return path
+
+
+# ════════════════════════════════════════
+# Split
+# ════════════════════════════════════════
 
 def split_file(path: str) -> list:
     size = os.path.getsize(path)
@@ -118,16 +139,16 @@ def split_file(path: str) -> list:
                 parts.append(pname)
     return parts
 
+
 # ════════════════════════════════════════
-# Upload Parallel (Fixed Total Chunks Logic)
+# Upload
 # ════════════════════════════════════════
 
-async def upload_large_file_parallel(file_path: str, status_cb=None, part_num: int = 1, total_parts: int = 1) -> InputFileBig:
-    file_size = os.path.getsize(file_path)
-    file_id = random.randint(0, 2**63)
-    # Important: Chunk ganana calculate karana widiya wenas kala
+async def upload_large_file_parallel(file_path: str, status_cb=None,
+                                      part_num: int = 1, total_parts: int = 1) -> InputFileBig:
+    file_size    = os.path.getsize(file_path)
+    file_id      = random.randint(0, 2**63)
     total_chunks = (file_size + UPLOAD_CHUNK - 1) // UPLOAD_CHUNK
-    
     uploaded_chunks = [0]
     lock = asyncio.Lock()
 
@@ -135,9 +156,9 @@ async def upload_large_file_parallel(file_path: str, status_cb=None, part_num: i
         for attempt in range(3):
             try:
                 await client(SaveBigFilePartRequest(
-                    file_id=file_id, 
-                    file_part=chunk_idx, 
-                    file_total_parts=total_chunks, 
+                    file_id=file_id,
+                    file_part=chunk_idx,
+                    file_total_parts=total_chunks,
                     bytes=data
                 ))
                 async with lock:
@@ -145,7 +166,11 @@ async def upload_large_file_parallel(file_path: str, status_cb=None, part_num: i
                     done = uploaded_chunks[0]
                     if status_cb and done % max(1, total_chunks // 15) == 0:
                         pct = int(done / total_chunks * 100)
-                        await status_cb(f"⬆️ **Uploading part {part_num}/{total_parts}**\n\n{make_bar(pct)} {pct}%\n📤 {min(done * UPLOAD_CHUNK, file_size)//(1024**2)} MB / {file_size//(1024**2)} MB")
+                        await status_cb(
+                            f"⬆️ **Uploading part {part_num}/{total_parts}**\n\n"
+                            f"{make_bar(pct)} {pct}%\n"
+                            f"📤 {min(done * UPLOAD_CHUNK, file_size)//(1024**2)} MB / {file_size//(1024**2)} MB"
+                        )
                 return
             except Exception as e:
                 if attempt == 2: raise e
@@ -153,7 +178,8 @@ async def upload_large_file_parallel(file_path: str, status_cb=None, part_num: i
 
     semaphore = asyncio.Semaphore(PARALLEL)
     async def bounded_upload(chunk_idx: int, data: bytes, client: TelegramClient):
-        async with semaphore: await upload_chunk(chunk_idx, data, client)
+        async with semaphore:
+            await upload_chunk(chunk_idx, data, client)
 
     tasks = []
     with open(file_path, "rb") as f:
@@ -165,6 +191,7 @@ async def upload_large_file_parallel(file_path: str, status_cb=None, part_num: i
     await asyncio.gather(*tasks)
     return InputFileBig(id=file_id, parts=total_chunks, name=os.path.basename(file_path))
 
+
 async def upload_parts(parts: list, original_name: str, status_cb=None):
     total = len(parts)
     for i, p in enumerate(parts, 1):
@@ -172,12 +199,14 @@ async def upload_parts(parts: list, original_name: str, status_cb=None):
         await user_clients[0](SendMediaRequest(
             peer="me",
             media=InputMediaUploadedDocument(
-                file=input_file, mime_type="application/octet-stream",
+                file=input_file,
+                mime_type="application/octet-stream",
                 attributes=[DocumentAttributeFilename(os.path.basename(p))]
             ),
             message=f"📦 {original_name}\n🗂 Part {i}/{total}",
             random_id=random.randint(0, 2**63),
         ))
+
 
 def cleanup(original: str, parts: list):
     targets = set(parts)
@@ -186,51 +215,136 @@ def cleanup(original: str, parts: list):
         try: os.remove(f)
         except: pass
 
+
 # ════════════════════════════════════════
-# Handlers
+# Core job processor
 # ════════════════════════════════════════
 
-active_jobs = {}
-
-@bot_client.on(events.NewMessage(pattern="/start"))
-async def start_handler(event):
-    await event.respond("📦 **GoFile Downloader Online!**\n\nSend a link to start.")
-
-@bot_client.on(events.NewMessage(pattern=r"https://gofile\.io/d/\S+"))
-async def gofile_handler(event):
-    chat_id = event.chat_id
-    if active_jobs.get(chat_id): return await event.respond("⏳ Please wait for current job.")
-    active_jobs[chat_id] = True
-    url = event.pattern_match.group(0).strip()
-    status_msg = await event.respond(f"🔍 Processing...")
-
-    async def update_status(text: str):
-        try: await status_msg.edit(text)
-        except: pass
-
+async def process_job(url: str, status_msg):
+    """Single job process — semaphore ලා MAX_JOBS limit enforce කරනවා"""
     original_file = None
     parts = []
+
+    async def update_status(text: str):
+        try:
+            await status_msg.edit(text)
+        except:
+            pass
+
     try:
+        await update_status("🔍 Resolving GoFile link...")
         dl_url, fname, size, hdrs = resolve_gofile(url)
+
+        await update_status(
+            f"📄 **{fname}**\n"
+            f"💾 {size//(1024**2)} MB\n\n"
+            f"{make_bar(0)} 0%\n"
+            f"⬇️ Starting download..."
+        )
+
         original_file = await download_file(dl_url, fname, hdrs, update_status)
         parts = split_file(original_file)
         await upload_parts(parts, fname, update_status)
-        await update_status(f"✅ **Done!** Check your Saved Messages.")
+
+        await update_status(
+            f"✅ **Done!**\n\n"
+            f"📦 `{fname}`\n"
+            f"🗂 {len(parts)} part(s) → Saved Messages"
+        )
+
     except Exception as e:
         await update_status(f"❌ **Error:**\n`{e}`")
+
     finally:
-        cleanup(original_file, parts)
-        active_jobs.pop(chat_id, None)
+        cleanup(original_file or "", parts)
+        active_urls.discard(url)
+
+
+# ════════════════════════════════════════
+# Bot handlers
+# ════════════════════════════════════════
+
+@bot_client.on(events.NewMessage(pattern="/start"))
+async def start_handler(event):
+    await event.respond(
+        "╔═══════════════════════╗\n"
+        "║  📦 **GoFile Downloader**  ║\n"
+        "╚═══════════════════════╝\n\n"
+        f"⚡ එකවර **{MAX_JOBS}** links handle කරනවා!\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📎 Link send කරන්න:\n"
+        "`https://gofile.io/d/XXXXXX`\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+@bot_client.on(events.NewMessage(pattern="/status"))
+async def status_handler(event):
+    count = MAX_JOBS - job_semaphore._value
+    await event.respond(
+        f"📊 **Queue Status**\n\n"
+        f"🔄 Active jobs : {count}/{MAX_JOBS}\n"
+        f"🕐 Waiting     : {max(0, len(active_urls) - count)}\n\n"
+        f"{'🟢 Free slots available!' if count < MAX_JOBS else '🔴 All slots busy!'}"
+    )
+
+
+@bot_client.on(events.NewMessage(pattern=r"https://gofile\.io/d/\S+"))
+async def gofile_handler(event):
+    url = event.pattern_match.group(0).strip()
+
+    # Duplicate check
+    if url in active_urls:
+        return await event.respond(f"⚠️ මේ link එක already processing!\n`{url}`")
+
+    active_urls.add(url)
+
+    # Queue position check
+    waiting = max(0, len(active_urls) - (MAX_JOBS - job_semaphore._value) - 1)
+
+    if job_semaphore._value == 0:
+        # All slots busy — queue ෙ wait
+        status_msg = await event.respond(
+            f"⏳ **Queued!**\n\n"
+            f"🕐 Position: #{waiting + 1}\n"
+            f"🔄 {MAX_JOBS}/{MAX_JOBS} slots busy\n\n"
+            f"Current jobs ඉවර වුනාම auto start වෙයි!"
+        )
+    else:
+        status_msg = await event.respond(f"🔍 Processing: `{url}`")
+
+    # Semaphore ෙකෙ wait කරලා job start කරනවා
+    async def run_with_semaphore():
+        async with job_semaphore:
+            # Slot available වුනාම queued message update
+            try:
+                await status_msg.edit(f"🔍 Starting: `{url}`")
+            except:
+                pass
+            await process_job(url, status_msg)
+
+    # Background task ලා run — bot block නොකරයි
+    asyncio.create_task(run_with_semaphore())
+
+
+# ════════════════════════════════════════
+# Main
+# ════════════════════════════════════════
 
 async def main():
-    print("[*] Starting User Clients...")
+    print("[*] Starting clients...")
     for i, client in enumerate(user_clients):
         await client.start()
-    
+        print(f"[✓] User client {i+1} connected.")
+
     await bot_client.start(bot_token=BOT_TOKEN)
     me = await bot_client.get_me()
-    print(f"[✓] Bot @{me.username} is running!")
+    print(f"[✓] Bot @{me.username} running!")
+    print(f"[*] Max concurrent jobs: {MAX_JOBS}")
+    print("[*] Waiting for GoFile links...")
+
     await bot_client.run_until_disconnected()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
