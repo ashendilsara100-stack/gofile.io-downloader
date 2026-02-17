@@ -23,9 +23,9 @@ OWNER_ID       = int(os.environ["OWNER_ID"])
 STRING_SESSION = os.environ.get("STRING_SESSION")
 
 # ── Config ─────────────────────────────────────────────────────────────────
-PART_SIZE  = 1990 * 1024 * 1024   # 1990 MB per split part
-CHUNK_SIZE = 512 * 1024           # 512 KB upload chunk
-CONCURRENT = 6                    # concurrent upload chunks
+PART_SIZE  = 1990 * 1024 * 1024
+CHUNK_SIZE = 512 * 1024
+CONCURRENT = 6
 UA         = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 WORK_DIR   = "/tmp/gofile_dl"
 
@@ -40,9 +40,9 @@ else:
 bot_client = TelegramClient("bot_session", API_ID, API_HASH)
 
 # ── Queue ──────────────────────────────────────────────────────────────────
-job_queue     = deque()   # (url, status_msg)
+job_queue     = deque()
 queue_urls    = set()
-is_processing = False
+worker_task   = None   # single worker reference
 
 
 # ════════════════════════════════════════
@@ -79,7 +79,7 @@ def resolve_gofile(page_url: str):
 
     wt   = get_website_token()
     hdrs = {
-        "Authorization":  f"Bearer {r['data']['token']}",
+        "Authorization":   f"Bearer {r['data']['token']}",
         "X-Website-Token": wt,
         "User-Agent":      UA,
     }
@@ -90,9 +90,9 @@ def resolve_gofile(page_url: str):
     if resp.get("status") != "ok":
         raise Exception(f"GoFile API: {resp.get('status')}")
 
-    data     = resp["data"]
+    data = resp["data"]
     children = data.get("children", {})
-    item     = next((v for v in children.values() if v.get("type") == "file"), None)
+    item = next((v for v in children.values() if v.get("type") == "file"), None)
     if not item:
         if data.get("type") == "file":
             item = data
@@ -123,8 +123,7 @@ def safe_remove(path: str):
 # Download
 # ════════════════════════════════════════
 
-async def download_file(url: str, fname: str, headers: dict,
-                        cb=None) -> str:
+async def download_file(url: str, fname: str, headers: dict, cb) -> str:
     path = os.path.join(WORK_DIR, fname)
     with requests.get(url, headers=headers, stream=True, timeout=120) as r:
         r.raise_for_status()
@@ -136,7 +135,7 @@ async def download_file(url: str, fname: str, headers: dict,
                 if chunk:
                     f.write(chunk)
                     done += len(chunk)
-                    if total and cb:
+                    if total:
                         pct = int(done / total * 100)
                         if pct - last_pct >= 5:
                             last_pct = pct
@@ -173,7 +172,6 @@ def split_file(path: str) -> list:
             if os.path.exists(pname) and os.path.getsize(pname) > 0:
                 parts.append(pname)
 
-    # Original file delete — parts ready
     safe_remove(path)
     return parts
 
@@ -182,12 +180,7 @@ def split_file(path: str) -> list:
 # Upload
 # ════════════════════════════════════════
 
-async def upload_part(file_path: str, cb=None,
-                      part_num: int = 1, total_parts: int = 1) -> InputFileBig:
-    """
-    Single part upload — CONCURRENT chunks via asyncio.gather.
-    Same single client use කරනවා — session conflict නෑ.
-    """
+async def upload_part(file_path: str, cb, part_num: int, total_parts: int) -> InputFileBig:
     file_size    = os.path.getsize(file_path)
     file_id      = random.randint(0, 2**63)
     total_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
@@ -205,7 +198,7 @@ async def upload_part(file_path: str, cb=None,
                         bytes=data,
                     ))
                     done[0] += 1
-                    if cb and done[0] % max(1, total_chunks // 20) == 0:
+                    if done[0] % max(1, total_chunks // 20) == 0:
                         pct     = int(done[0] / total_chunks * 100)
                         done_mb = min(done[0] * CHUNK_SIZE, file_size) // (1024**2)
                         tot_mb  = file_size // (1024**2)
@@ -216,7 +209,7 @@ async def upload_part(file_path: str, cb=None,
                             f"⚡ {CONCURRENT} concurrent chunks"
                         )
                     return
-                except Exception as e:
+                except Exception:
                     if attempt == 2:
                         raise
                     await asyncio.sleep(2 ** attempt)
@@ -230,36 +223,20 @@ async def upload_part(file_path: str, cb=None,
             tasks.append(upload_one(i, data))
 
     await asyncio.gather(*tasks)
-
-    return InputFileBig(
-        id=file_id,
-        parts=total_chunks,
-        name=os.path.basename(file_path),
-    )
+    return InputFileBig(id=file_id, parts=total_chunks, name=os.path.basename(file_path))
 
 
-async def upload_all_parts(parts: list, original_name: str, cb=None):
-    """
-    Parts one by one upload → immediately delete.
-    Disk space: max 1 part at a time.
-    """
+async def upload_all_parts(parts: list, original_name: str, cb):
     total = len(parts)
-
     for i, p in enumerate(parts, 1):
         size_mb = os.path.getsize(p) // (1024**2)
-
-        if cb:
-            await cb(
-                f"⬆️ **Uploading part {i}/{total}**\n\n"
-                f"{make_bar(0)} 0%\n"
-                f"📤 0 MB / {size_mb} MB\n"
-                f"⚡ {CONCURRENT} concurrent chunks"
-            )
-
-        # Upload
+        await cb(
+            f"⬆️ **Uploading part {i}/{total}**\n\n"
+            f"{make_bar(0)} 0%\n"
+            f"📤 0 MB / {size_mb} MB\n"
+            f"⚡ {CONCURRENT} concurrent chunks"
+        )
         input_file = await upload_part(p, cb, i, total)
-
-        # Send to Saved Messages
         await user_client(SendMediaRequest(
             peer="me",
             media=InputMediaUploadedDocument(
@@ -270,83 +247,100 @@ async def upload_all_parts(parts: list, original_name: str, cb=None):
             message=f"📦 {original_name}\n🗂 Part {i}/{total}",
             random_id=random.randint(0, 2**63),
         ))
-
-        # Immediately delete — disk free
         safe_remove(p)
-
-        if cb:
-            await cb(f"✅ **Part {i}/{total} done!**")
+        await cb(f"✅ **Part {i}/{total} done!**")
 
 
 # ════════════════════════════════════════
-# Queue worker
+# Single job processor
+# ════════════════════════════════════════
+
+async def process_one(url: str, status_msg):
+    """
+    Process single job.
+    cb closure — status_msg passed as argument (no loop capture bug).
+    """
+    parts = []
+
+    async def cb(text: str):
+        try:
+            await status_msg.edit(text)
+        except:
+            pass
+
+    try:
+        q_info = f"\n📋 {len(job_queue)} in queue" if job_queue else ""
+        await cb(f"🔍 Resolving...{q_info}")
+
+        dl_url, fname, size, hdrs = resolve_gofile(url)
+        await cb(
+            f"📄 **{fname}**\n"
+            f"💾 {size//(1024**2)} MB\n\n"
+            f"{make_bar(0)} 0%\n"
+            f"⬇️ Downloading...{q_info}"
+        )
+
+        path  = await download_file(dl_url, fname, hdrs, cb)
+        parts = split_file(path)
+        await upload_all_parts(parts, fname, cb)
+
+        next_info = f"\n\n▶️ Next: `{job_queue[0][0]}`" if job_queue else ""
+        await cb(
+            f"🎉 **Done!**\n\n"
+            f"📦 `{fname}`\n"
+            f"🗂 {len(parts)} part(s) → Saved Messages"
+            f"{next_info}"
+        )
+
+    except Exception as e:
+        await cb(f"❌ **Error:**\n`{e}`")
+
+    finally:
+        for p in parts:
+            safe_remove(p)
+        queue_urls.discard(url)
+
+
+# ════════════════════════════════════════
+# Queue worker — guaranteed single instance
 # ════════════════════════════════════════
 
 async def queue_worker():
-    global is_processing
+    """
+    Single worker loop.
+    job_queue ෙ items one by one process කරනවා.
+    Worker done වුනාම global worker_task = None.
+    """
+    global worker_task
 
     while job_queue:
         url, status_msg = job_queue.popleft()
 
-        # ── Fix: capture status_msg in closure ──
-        captured_msg = status_msg
-
-        async def cb(text: str, msg=captured_msg):
+        # Notify next if queued
+        if job_queue:
             try:
-                await msg.edit(text)
+                await job_queue[0][1].edit(
+                    f"📋 **Queued #{len(job_queue)}**\n\n"
+                    f"`{job_queue[0][0]}`\n\n"
+                    f"⏳ Current job ඉවර වුනාම start..."
+                )
             except:
                 pass
 
-        parts = []
-        try:
-            q_info = f"\n📋 {len(job_queue)} in queue" if job_queue else ""
+        await process_one(url, status_msg)
 
-            await cb(f"🔍 Resolving...{q_info}")
-            dl_url, fname, size, hdrs = resolve_gofile(url)
+        # Notify next job starting
+        if job_queue:
+            try:
+                await job_queue[0][1].edit(
+                    f"▶️ **Starting now!**\n`{job_queue[0][0]}`"
+                )
+            except:
+                pass
 
-            await cb(
-                f"📄 **{fname}**\n"
-                f"💾 {size//(1024**2)} MB\n\n"
-                f"{make_bar(0)} 0%\n"
-                f"⬇️ Downloading...{q_info}"
-            )
+        await asyncio.sleep(0.5)
 
-            path  = await download_file(dl_url, fname, hdrs, cb)
-            parts = split_file(path)   # original auto deleted inside split_file
-
-            await upload_all_parts(parts, fname, cb)
-
-            next_info = f"\n\n▶️ Next: `{job_queue[0][0]}`" if job_queue else ""
-            await cb(
-                f"🎉 **Done!**\n\n"
-                f"📦 `{fname}`\n"
-                f"🗂 {len(parts)} part(s) → Saved Messages"
-                f"{next_info}"
-            )
-
-        except Exception as e:
-            await cb(f"❌ **Error:**\n`{e}`")
-
-        finally:
-            # Cleanup leftover files
-            for f in parts:
-                safe_remove(f)
-
-            queue_urls.discard(url)
-
-            # Notify next job
-            if job_queue:
-                next_url, next_msg = job_queue[0]
-                try:
-                    await next_msg.edit(
-                        f"▶️ **Starting now!**\n`{next_url}`"
-                    )
-                except:
-                    pass
-
-            await asyncio.sleep(1)
-
-    is_processing = False
+    worker_task = None
 
 
 # ════════════════════════════════════════
@@ -371,11 +365,11 @@ async def start_handler(event):
 
 @bot_client.on(events.NewMessage(pattern="/queue"))
 async def queue_handler(event):
-    if not job_queue and not is_processing:
+    if not job_queue and worker_task is None:
         return await event.respond("✅ Queue empty — bot ready!")
     lines = [f"📋 **Queue** ({len(job_queue)} waiting)\n"]
-    if is_processing:
-        lines.insert(1, "🔄 1 job processing\n")
+    if worker_task is not None:
+        lines.insert(1, "🔄 1 job processing now\n")
     for i, (url, _) in enumerate(job_queue, 1):
         lines.append(f"{i}. `{url}`")
     await event.respond("\n".join(lines))
@@ -383,15 +377,17 @@ async def queue_handler(event):
 
 @bot_client.on(events.NewMessage(pattern=r"https://gofile\.io/d/\S+"))
 async def gofile_handler(event):
-    global is_processing
+    global worker_task
 
     url = event.pattern_match.group(0).strip()
 
+    # Duplicate check
     if url in queue_urls:
         return await event.respond(f"⚠️ Already queued!\n`{url}`")
 
     queue_urls.add(url)
-    pos = len(job_queue) + (1 if is_processing else 0)
+
+    pos = len(job_queue) + (1 if worker_task is not None else 0)
 
     if pos == 0:
         status_msg = await event.respond("🔍 Starting...")
@@ -404,9 +400,9 @@ async def gofile_handler(event):
 
     job_queue.append((url, status_msg))
 
-    if not is_processing:
-        is_processing = True
-        asyncio.create_task(queue_worker())
+    # Single worker guarantee — already running නම් spawn නොකරයි
+    if worker_task is None or worker_task.done():
+        worker_task = asyncio.create_task(queue_worker())
 
 
 # ════════════════════════════════════════
