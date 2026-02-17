@@ -1,22 +1,19 @@
 import os
-import asyncio
-from telethon import TelegramClient
+from telethon.sync import TelegramClient
 from telethon.sessions import StringSession
 
-# Details
-API_ID   = int(os.environ["TG_API_ID"])
-API_HASH = os.environ["TG_API_HASH"]
-PHONE    = os.environ["TG_PHONE"]
+# API ID eka 38963550 widiyata fix kala
+API_ID = 38963550 
+API_HASH = "1e7e73506dd3e91f2c513240e701945d"
 
-async def main():
-    # StringSession() kiyala dammama session eka text ekak widihata hadenawa
-    async with TelegramClient(StringSession(), API_ID, API_HASH) as client:
-        await client.start(phone=PHONE)
-        print("\n" + "="*50)
-        print("OYAAGE STRING SESSION EKA PAHATHTHA THIYENAWA (COPY ME):")
-        print(f"\n{client.session.save()}\n")
-        print("="*50)
-        print("\n[!] Me code eka copy karala Railway/GitHub Secrets wala STRING_SESSION kiyala danna.")
-
-if __name__ == "__main__":
-    asyncio.run(main())
+print("--- Telegram Session Generator ---")
+try:
+    with TelegramClient(StringSession(), API_ID, API_HASH) as client:
+        session_string = client.session.save()
+        print("\n✅ OYAGE STRING SESSION EKA PAHATHA DAKWE:")
+        print("-" * 60)
+        print(session_string)
+        print("-" * 60)
+        print("\nUda thiyena code eka copy karala GitHub Secrets wala STRING_SESSION widiyata danna.")
+except Exception as e:
+    print(f"\n❌ Error ekak awa: {e}")
