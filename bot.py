@@ -4,7 +4,7 @@ import math
 import asyncio
 import random
 import requests
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 from telethon.tl.functions.upload import SaveBigFilePartRequest
 from telethon.tl.functions.messages import SendMediaRequest
 from telethon.tl.types import (
@@ -13,24 +13,21 @@ from telethon.tl.types import (
     DocumentAttributeFilename,
 )
 
-# ── ENV variables eka read karanawa (.env file eke tiyenawa) ──────────────
-API_ID       = int(os.environ["TG_API_ID"])
-API_HASH     = os.environ["TG_API_HASH"]
-BOT_TOKEN    = os.environ["BOT_TOKEN"]       # @BotFather eken ganna
-OWNER_ID     = int(os.environ["OWNER_ID"])   # oya ge Telegram user ID (bot commands allow karanna)
-USER_PHONE   = os.environ["TG_PHONE"]        # upload destination (oya ge Saved Messages)
+# ── ENV variables ──────────────────────────────────────────────────────────
+API_ID     = int(os.environ["TG_API_ID"])
+API_HASH   = os.environ["TG_API_HASH"]
+BOT_TOKEN  = os.environ["BOT_TOKEN"]
+OWNER_ID   = int(os.environ["OWNER_ID"])
+USER_PHONE = os.environ["TG_PHONE"]
 
-# 1990 MB — Telegram 2GB limit eke safe margin
-PART_SIZE    = 1990 * 1024 * 1024
-UPLOAD_CHUNK = 512 * 1024
+# ── Config ─────────────────────────────────────────────────────────────────
+PART_SIZE    = 1990 * 1024 * 1024   # 1990 MB per part
+UPLOAD_CHUNK = 2048 * 1024          # 2 MB chunks (faster upload)
 UA           = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 WORK_DIR     = "/tmp/gofile_downloads"
 
 os.makedirs(WORK_DIR, exist_ok=True)
 
-# ── Two clients:
-#    bot_client  — commands receive karanna (BOT_TOKEN)
-#    user_client — Saved Messages upload karanna (phone session)
 bot_client  = TelegramClient("bot_session",  API_ID, API_HASH)
 user_client = TelegramClient("user_session", API_ID, API_HASH)
 
@@ -59,11 +56,12 @@ def get_website_token() -> str:
 
 
 def resolve_gofile(page_url: str):
-    """Returns (download_url, filename, file_size, auth_headers)"""
     content_id = page_url.rstrip("/").split("/d/")[-1]
 
-    r = requests.post("https://api.gofile.io/accounts",
-                      headers={"User-Agent": UA}, timeout=15).json()
+    r = requests.post(
+        "https://api.gofile.io/accounts",
+        headers={"User-Agent": UA}, timeout=15
+    ).json()
     if r.get("status") != "ok":
         raise Exception(f"Guest token fail: {r}")
     guest_token = r["data"]["token"]
@@ -95,6 +93,16 @@ def resolve_gofile(page_url: str):
 
 
 # ════════════════════════════════════════
+# Progress bar helper
+# ════════════════════════════════════════
+
+def make_progress_bar(pct: int, length: int = 12) -> str:
+    filled = int(length * pct / 100)
+    bar    = "█" * filled + "░" * (length - filled)
+    return f"[{bar}]"
+
+
+# ════════════════════════════════════════
 # Download
 # ════════════════════════════════════════
 
@@ -103,9 +111,9 @@ async def download_file(url: str, filename: str, headers: dict,
     path = os.path.join(WORK_DIR, filename)
     with requests.get(url, headers=headers, stream=True, timeout=60) as r:
         r.raise_for_status()
-        total = int(r.headers.get("content-length", 0))
-        done  = 0
-        last_pct = -5
+        total    = int(r.headers.get("content-length", 0))
+        done     = 0
+        last_pct = -10
         with open(path, "wb") as f:
             for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
                 if chunk:
@@ -113,11 +121,13 @@ async def download_file(url: str, filename: str, headers: dict,
                     done += len(chunk)
                     if total and status_cb:
                         pct = int(done / total * 100)
-                        if pct - last_pct >= 10:
+                        if pct - last_pct >= 5:
                             last_pct = pct
+                            bar = make_progress_bar(pct)
                             await status_cb(
-                                f"⬇️ Downloading... {pct}%  "
-                                f"({done//(1024**2)}MB / {total//(1024**2)}MB)"
+                                f"⬇️ **Downloading...**\n\n"
+                                f"{bar} {pct}%\n"
+                                f"📦 {done//(1024**2)} MB / {total//(1024**2)} MB"
                             )
     return path
 
@@ -152,35 +162,49 @@ def split_file(path: str) -> list:
 
 
 # ════════════════════════════════════════
-# Upload (SaveBigFilePartRequest — 2GB safe)
+# Upload — live MB progress
 # ════════════════════════════════════════
 
-async def upload_large_file(file_path: str) -> InputFileBig:
-    file_size   = os.path.getsize(file_path)
-    file_id     = random.randint(0, 2**63)
-    total_parts = math.ceil(file_size / UPLOAD_CHUNK)
+async def upload_large_file(file_path: str, status_cb=None,
+                             part_idx: int = 1, total_parts: int = 1) -> InputFileBig:
+    file_size      = os.path.getsize(file_path)
+    file_id        = random.randint(0, 2**63)
+    total_chunks   = math.ceil(file_size / UPLOAD_CHUNK)
+    uploaded_bytes = 0
+    last_pct       = -10
 
     with open(file_path, "rb") as f:
-        for idx in range(total_parts):
+        for idx in range(total_chunks):
             chunk = f.read(UPLOAD_CHUNK)
             if not chunk:
                 break
             await user_client(SaveBigFilePartRequest(
                 file_id=file_id,
                 file_part=idx,
-                file_total_parts=total_parts,
+                file_total_parts=total_chunks,
                 bytes=chunk,
             ))
+            uploaded_bytes += len(chunk)
+
+            if status_cb:
+                pct = int(uploaded_bytes / file_size * 100)
+                if pct - last_pct >= 5:
+                    last_pct = pct
+                    bar = make_progress_bar(pct)
+                    await status_cb(
+                        f"⬆️ **Uploading part {part_idx}/{total_parts}**\n\n"
+                        f"{bar} {pct}%\n"
+                        f"📤 {uploaded_bytes//(1024**2)} MB / {file_size//(1024**2)} MB"
+                    )
 
     return InputFileBig(
         id=file_id,
-        parts=total_parts,
+        parts=total_chunks,
         name=os.path.basename(file_path),
     )
 
 
-async def upload_parts(parts: list, original_name: str,
-                       status_cb=None):
+async def upload_parts(parts: list, original_name: str, status_cb=None):
     total = len(parts)
     for i, p in enumerate(parts, 1):
         fname   = os.path.basename(p)
@@ -188,9 +212,14 @@ async def upload_parts(parts: list, original_name: str,
         caption = f"📦 {original_name}\n🗂 Part {i}/{total}"
 
         if status_cb:
-            await status_cb(f"⬆️ Uploading part {i}/{total}  ({size_mb} MB)...")
+            await status_cb(
+                f"⬆️ **Uploading part {i}/{total}**\n\n"
+                f"{make_progress_bar(0)} 0%\n"
+                f"📤 0 MB / {size_mb} MB"
+            )
 
-        input_file = await upload_large_file(p)
+        input_file = await upload_large_file(p, status_cb, i, total)
+
         await user_client(SendMediaRequest(
             peer="me",
             media=InputMediaUploadedDocument(
@@ -203,7 +232,7 @@ async def upload_parts(parts: list, original_name: str,
         ))
 
         if status_cb:
-            await status_cb(f"✅ Part {i}/{total} uploaded!")
+            await status_cb(f"✅ **Part {i}/{total} uploaded!**\n📦 {fname}")
 
 
 # ════════════════════════════════════════
@@ -225,32 +254,84 @@ def cleanup(original: str, parts: list):
 # Bot handlers
 # ════════════════════════════════════════
 
-active_jobs = {}   # chat_id → True (duplicate prevent karanna)
+active_jobs = {}
+
 
 @bot_client.on(events.NewMessage(pattern="/start"))
 async def start_handler(event):
+    buttons = [
+        [
+            Button.inline("📖 How to Use", b"howto"),
+            Button.url("👨‍💻 Developer", "https://t.me/ashencode"),
+        ],
+        [
+            Button.inline("ℹ️ About", b"about"),
+        ],
+    ]
     await event.respond(
-        "👋 **GoFile → Telegram Bot**\n\n"
-        "GoFile link ekak send karanna:\n"
-        "`https://gofile.io/d/XXXXXX`\n\n"
-        "Bot auto download → upload to Saved Messages."
+        "╔═══════════════════════╗\n"
+        "║  📦 **GoFile Downloader**  ║\n"
+        "╚═══════════════════════╝\n\n"
+        "🚀 GoFile links auto download කරලා\n"
+        "    ඔබේ **Saved Messages** ෙ upload කරනවා!\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📎 Link send කරන්න:\n"
+        "`https://gofile.io/d/XXXXXX`\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━",
+        buttons=buttons,
     )
+
+
+@bot_client.on(events.CallbackQuery(data=b"howto"))
+async def howto_handler(event):
+    await event.answer()
+    await event.respond(
+        "📖 **How to Use**\n\n"
+        "**1️⃣** GoFile share link copy කරන්න\n"
+        "       `https://gofile.io/d/XXXXXX`\n\n"
+        "**2️⃣** Bot ෙකට paste කරලා send කරන්න\n\n"
+        "**3️⃣** Bot auto:\n"
+        "       ⬇️ Download\n"
+        "       ✂️ 2GB parts walata split\n"
+        "       ⬆️ Saved Messages upload\n\n"
+        "**4️⃣** Done! ✅\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "💡 Progress live ලා පෙනෙනවා!",
+        buttons=[[Button.inline("🔙 Back", b"back")]],
+    )
+
+
+@bot_client.on(events.CallbackQuery(data=b"about"))
+async def about_handler(event):
+    await event.answer()
+    await event.respond(
+        "ℹ️ **About**\n\n"
+        "🤖 **GoFile → Telegram Bot**\n\n"
+        "✅ GoFile auto download\n"
+        "✅ 2GB parts support\n"
+        "✅ Live progress bar\n"
+        "✅ Fast upload\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "👨‍💻 Dev: @ashencode",
+        buttons=[[Button.inline("🔙 Back", b"back")]],
+    )
+
+
+@bot_client.on(events.CallbackQuery(data=b"back"))
+async def back_handler(event):
+    await event.answer()
+    await start_handler(event)
 
 
 @bot_client.on(events.NewMessage(pattern=r"https://gofile\.io/d/\S+"))
 async def gofile_handler(event):
     chat_id = event.chat_id
 
-    # Only owner or allow all — oya decide karanna
-    # OWNER ONLY nattam: uncomment next 2 lines
-    # if event.sender_id != OWNER_ID:
-    #     return await event.respond("⛔ Unauthorized.")
-
     if active_jobs.get(chat_id):
         return await event.respond("⏳ Job ekak already running. Wait karanna.")
 
     active_jobs[chat_id] = True
-    url = event.pattern_match.group(0).strip()
+    url        = event.pattern_match.group(0).strip()
     status_msg = await event.respond(f"🔍 Processing: `{url}`")
 
     async def update_status(text: str):
@@ -262,37 +343,34 @@ async def gofile_handler(event):
     original_file = None
     parts = []
     try:
-        # 1. Resolve
         await update_status("🔍 GoFile link resolve karanawa...")
         dl_url, fname, size, hdrs = resolve_gofile(url)
+
         await update_status(
             f"📄 **{fname}**\n"
-            f"💾 Size: {size//(1024**2)} MB\n"
-            f"⬇️ Downloading..."
+            f"💾 Size: {size//(1024**2)} MB\n\n"
+            f"{make_progress_bar(0)} 0%\n"
+            f"⬇️ Starting download..."
         )
 
-        # 2. Download
         original_file = await download_file(dl_url, fname, hdrs, update_status)
 
-        # 3. Split
         await update_status("✂️ Splitting into 2GB parts...")
         parts = split_file(original_file)
-        await update_status(
-            f"✂️ Split: {len(parts)} part(s)\n"
-            f"⬆️ Uploading to Saved Messages..."
-        )
 
-        # 4. Upload
         await upload_parts(parts, fname, update_status)
 
+        total_size = sum(os.path.getsize(p) for p in parts if os.path.exists(p))
         await update_status(
             f"🎉 **Done!**\n\n"
             f"📦 `{fname}`\n"
-            f"🗂 {len(parts)} part(s) → Saved Messages"
+            f"🗂 Parts: {len(parts)}\n"
+            f"💾 Total: {total_size//(1024**2)} MB\n\n"
+            f"✅ Saved Messages ෙ check කරන්න!"
         )
 
     except Exception as e:
-        await update_status(f"❌ Error:\n`{e}`")
+        await update_status(f"❌ **Error:**\n`{e}`")
 
     finally:
         cleanup(original_file or "", parts)
@@ -304,11 +382,9 @@ async def gofile_handler(event):
 # ════════════════════════════════════════
 
 async def main():
-    # User client start (Saved Messages upload karanna)
     await user_client.start(phone=USER_PHONE)
     print("[✓] User client connected.")
 
-    # Bot client start
     await bot_client.start(bot_token=BOT_TOKEN)
     me = await bot_client.get_me()
     print(f"[✓] Bot started: @{me.username}")
