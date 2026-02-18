@@ -16,14 +16,12 @@ from telethon.tl.types import (
     DocumentAttributeFilename,
 )
 
-# ── ENV ────────────────────────────────────────────────────────────────────
 API_ID         = int(os.environ["TG_API_ID"])
 API_HASH       = os.environ["TG_API_HASH"]
 BOT_TOKEN      = os.environ["BOT_TOKEN"]
 OWNER_ID       = int(os.environ["OWNER_ID"])
 STRING_SESSION = os.environ.get("STRING_SESSION")
 
-# ── Config ─────────────────────────────────────────────────────────────────
 PART_SIZE  = 1990 * 1024 * 1024
 CHUNK_SIZE = 512 * 1024
 CONCURRENT = 8
@@ -32,7 +30,6 @@ WORK_DIR   = "/tmp/gofile_dl"
 
 os.makedirs(WORK_DIR, exist_ok=True)
 
-# ── Clients ────────────────────────────────────────────────────────────────
 if STRING_SESSION:
     user_client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 else:
@@ -40,14 +37,9 @@ else:
 
 bot_client = TelegramClient("bot_session", API_ID, API_HASH)
 
-# ── Queue ──────────────────────────────────────────────────────────────────
 job_queue   = deque()
 queue_urls  = set()
 worker_task = None
-
-# ════════════════════════════════════════
-# GoFile & Utility
-# ════════════════════════════════════════
 
 def get_website_token() -> str:
     r = requests.get(
@@ -108,33 +100,13 @@ def safe_remove(path: str):
     except:
         pass
 
-# ════════════════════════════════════════
-# Core Functions
-# ════════════════════════════════════════
-
 async def download_file(url: str, fname: str, headers: dict, cb) -> str:
     path = os.path.join(WORK_DIR, fname)
     last_edit = 0
-    loop = asyncio.get_event_loop()
-
-    def _download():
-        with requests.get(url, headers=headers, stream=True, timeout=120) as r:
-            r.raise_for_status()
-            total = int(r.headers.get("content-length", 0))
-            done = 0
-            with open(path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-                        done += len(chunk)
-                        yield done, total
-
-    gen = _download()
-    total = 0
-    done = 0
     with requests.get(url, headers=headers, stream=True, timeout=120) as r:
         r.raise_for_status()
         total = int(r.headers.get("content-length", 0))
+        done = 0
         with open(path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
                 if chunk:
@@ -159,7 +131,6 @@ async def upload_part(file_path: str, cb, part_num: int, total_parts: int) -> In
     last_edit = 0
     sem = asyncio.Semaphore(CONCURRENT)
 
-    # ✅ File data prior read කරලා pass කරන්න (parallel file pointer bug fix)
     chunks = []
     with open(file_path, "rb") as f:
         for i in range(total_chunks):
@@ -190,21 +161,16 @@ async def upload_part(file_path: str, cb, part_num: int, total_parts: int) -> In
                     return
                 except Exception as e:
                     print(f"⚠️ Chunk {idx} attempt {attempt} failed: {e}")
-                    await asyncio.sleep(2 ** min(attempt, 5))  # Exponential backoff
+                    await asyncio.sleep(2 ** min(attempt, 5))
 
     await asyncio.gather(*[upload_one(i, d) for i, d in chunks])
     return InputFileBig(id=file_id, parts=total_chunks, name=os.path.basename(file_path))
-
-# ════════════════════════════════════════
-# Queue Worker
-# ════════════════════════════════════════
 
 async def queue_worker():
     global worker_task
     while job_queue:
         url, status_msg = job_queue.popleft()
 
-        # ✅ cb closure bug fix - status_msg capture correctly
         def make_cb(msg):
             async def cb(text: str):
                 try:
@@ -227,7 +193,6 @@ async def queue_worker():
             parts = []
 
             if n_parts > 1:
-                print(f"✂️ Splitting into {n_parts} parts...")
                 with open(path, "rb") as f:
                     for i in range(n_parts):
                         pname = f"{path}.part{i+1}"
@@ -266,22 +231,13 @@ async def queue_worker():
 
     worker_task = None
 
-# ════════════════════════════════════════
-# Bot Handler
-# ════════════════════════════════════════
-
+# ✅ OWNER_ID check නෑ - ඕනෑම කෙනෙකුට use කළ හැකිය
 @bot_client.on(events.NewMessage(pattern=r"https://gofile\.io/d/\S+"))
 async def gofile_handler(event):
     global worker_task
 
-    # ✅ Owner පමණක් use කළ හැකිය
-    sender = await event.get_sender()
-    if not sender or sender.id != OWNER_ID:
-        print(f"⛔ Unauthorized access attempt by: {sender.id if sender else 'Unknown'}")
-        return await event.respond("⛔ Unauthorized.")
-
     url = event.pattern_match.group(0).strip()
-    print(f"📨 Received URL: {url}")
+    print(f"📨 Received URL from {event.sender_id}: {url}")
 
     if url in queue_urls:
         return await event.respond("⚠️ Link eka queue eke thiyenne.")
@@ -293,10 +249,6 @@ async def gofile_handler(event):
 
     if worker_task is None or worker_task.done():
         worker_task = asyncio.create_task(queue_worker())
-
-# ════════════════════════════════════════
-# Main - Debug friendly
-# ════════════════════════════════════════
 
 async def main():
     print("🚀 Starting bot...")
