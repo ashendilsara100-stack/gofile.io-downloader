@@ -14,7 +14,8 @@ CHANNEL_ID     = -1003818449922
 
 WORK_DIR   = "downloads"
 CHUNK_SIZE = 512 * 1024
-UA         = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+UA         = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+PROXIES    = {"http": "socks5h://127.0.0.1:40000", "https": "socks5h://127.0.0.1:40000"}
 
 os.makedirs(WORK_DIR, exist_ok=True)
 
@@ -28,7 +29,10 @@ worker_running = False
 
 def get_website_token():
     try:
-        r = requests.get("https://gofile.io/dist/js/config.js", headers={"User-Agent": UA}, timeout=15)
+        r = requests.get(
+            "https://gofile.io/dist/js/config.js",
+            headers={"User-Agent": UA}, proxies=PROXIES, timeout=15
+        )
         if 'appdata.wt = "' in r.text:
             return r.text.split('appdata.wt = "')[1].split('"')[0]
         m = re.search(r'websiteToken["\']?\s*[=:]\s*["\']([^"\']{4,})["\']', r.text)
@@ -37,27 +41,39 @@ def get_website_token():
         return "none"
 
 def resolve_gofile(page_url):
-    cid = page_url.rstrip("/").split("/d/")[-1]
-    hdrs = {"User-Agent": UA, "Accept": "application/json",
-            "Referer": "https://gofile.io/", "Origin": "https://gofile.io"}
+    cid  = page_url.rstrip("/").split("/d/")[-1]
+    hdrs = {
+        "User-Agent": UA,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://gofile.io/",
+        "Origin": "https://gofile.io"
+    }
 
     acc_token = None
-    for _ in range(3):
+    for _ in range(5):
         try:
-            r = requests.post("https://api.gofile.io/accounts", headers=hdrs, timeout=20).json()
+            r = requests.post(
+                "https://api.gofile.io/accounts",
+                headers=hdrs, proxies=PROXIES, timeout=20
+            ).json()
             if r.get("status") == "ok":
                 acc_token = r["data"]["token"]
                 break
         except:
-            time.sleep(2)
+            time.sleep(3)
 
     if not acc_token:
         raise Exception("GoFile guest account creation failed.")
 
-    wt = get_website_token()
+    wt       = get_website_token()
     api_hdrs = {**hdrs, "Authorization": f"Bearer {acc_token}", "X-Website-Token": wt}
 
-    resp = requests.get(f"https://api.gofile.io/contents/{cid}?cache=true", headers=api_hdrs, timeout=25).json()
+    resp = requests.get(
+        f"https://api.gofile.io/contents/{cid}?cache=true",
+        headers=api_hdrs, proxies=PROXIES, timeout=25
+    ).json()
+
     if resp.get("status") != "ok":
         raise Exception(f"GoFile API Error: {resp.get('status')}")
 
@@ -130,11 +146,10 @@ async def process_job(url, status_msg):
         dl_url, fname, size, hdrs = resolve_gofile(url)
         path = os.path.join(WORK_DIR, fname)
 
-        await status_msg.edit(f"📥 **Downloading:** `{fname}`\n📦 {size//(1024**2)} MB")
-        with requests.get(dl_url, headers=hdrs, stream=True, timeout=120) as r:
+        done, last_edit = 0, 0
+        with requests.get(dl_url, headers=hdrs, proxies=PROXIES, stream=True, timeout=120) as r:
             r.raise_for_status()
-            done, total = 0, int(r.headers.get("content-length", 0))
-            last_edit = 0
+            total = int(r.headers.get("content-length", 0))
             with open(path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024*1024):
                     if chunk:
