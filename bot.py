@@ -70,7 +70,7 @@ async def fast_upload(client, file_path, status_msg, fname):
 # --- GOFILE LOGIC (WARP ENABLED & IMPROVED) ---
 def get_website_token():
     try:
-        # User-agent එකක් නැතිව සමහරවිට config file එක දෙන්නේ නැහැ
+        # browser headers ලබා දීම අනිවාර්යයි
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"}
         r = requests.get("https://gofile.io/dist/js/config.js", proxies=PROXIES, headers=headers, timeout=15)
         m = re.search(r'websiteToken["\']?\s*[=:]\s*["\']([^"\']{4,})["\']', r.text)
@@ -81,35 +81,43 @@ def resolve_gofile(page_url):
     try:
         cid = page_url.rstrip("/").split("/d/")[-1]
         sess = requests.Session()
-        sess.proxies.update(PROXIES) 
+        sess.proxies.update(PROXIES)
         
-        # Browser එකක් ලෙස හැසිරීමට Headers එකතු කිරීම
+        # Real browser headers ඇතුළත් කිරීම
         sess.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "Accept": "application/json",
             "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://gofile.io/",
+            "Origin": "https://gofile.io"
         })
 
-        # 1. Guest Account එකක් සාදා ගැනීම
-        acc_resp = sess.post("https://api.gofile.io/accounts", timeout=20).json()
-        if acc_resp.get("status") != "ok":
-            raise Exception("API blocked account creation.")
-        token = acc_resp['data']['token']
+        # 1. Guest Account සාදා ගැනීම (Retry සමඟ)
+        acc_token = None
+        for _ in range(3):
+            try:
+                acc_resp = sess.post("https://api.gofile.io/accounts", timeout=20).json()
+                if acc_resp.get("status") == "ok":
+                    acc_token = acc_resp['data']['token']
+                    break
+            except:
+                time.sleep(2)
         
-        # 2. Website Token ලබා ගැනීම
+        if not acc_token:
+            raise Exception("API blocked account creation. Try restarting Warp.")
+        
         wt = get_website_token()
         headers = {
-            "Authorization": f"Bearer {token}",
-            "X-Website-Token": wt,
-            "Origin": "https://gofile.io",
-            "Referer": f"https://gofile.io/d/{cid}"
+            "Authorization": f"Bearer {acc_token}",
+            "X-Website-Token": wt
         }
         
-        # 3. Content විස්තර ලබා ගැනීම
+        # 2. Content ලබා ගැනීම
         resp = sess.get(f"https://api.gofile.io/contents/{cid}?cache=true", headers=headers, timeout=25).json()
         
         if resp.get("status") != "ok":
-            status_info = resp.get("status", "Unknown Error")
-            raise Exception(f"Gofile API Error: {status_info}")
+            error_data = resp.get("status", "Unknown API Error")
+            raise Exception(f"Gofile API Error: {error_data}")
             
         data = resp.get("data", {})
         children = data.get("children", {})
@@ -120,17 +128,13 @@ def resolve_gofile(page_url):
             item = next((v for v in children.values() if v.get("type") == "file"), None)
         elif isinstance(children, list):
             item = next((v for v in children if v.get("type") == "file"), None)
-        
-        # Folder එකක් නම් ඒක ඇතුළේ ඇති පළමු file එක
-        if not item and data.get("type") == "file":
-            item = data
             
         if not item:
-            raise Exception("No file found. Link might be empty or password protected.")
+            raise Exception("No downloadable file found in this link.")
             
         return item["link"], item["name"], item.get("size", 0), headers
     except Exception as e:
-        raise Exception(f"Resolve Error: {str(e)}")
+        raise Exception(f"Warp/Gofile Error: {str(e)}")
 
 # --- WORKER ---
 async def process_job(url, status_msg):
@@ -145,7 +149,7 @@ async def process_job(url, status_msg):
         with requests.get(dl_url, headers=hdrs, stream=True, timeout=60, proxies=PROXIES) as r:
             r.raise_for_status()
             with open(path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=5*1024*1024): # 5MB buffer
+                for chunk in r.iter_content(chunk_size=10*1024*1024): # 10MB buffer
                     if chunk: f.write(chunk)
 
         # Fast Upload to Telegram
