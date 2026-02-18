@@ -13,7 +13,7 @@ STRING_SESSION = os.environ.get("STRING_SESSION", "")
 CHANNEL_ID     = -1003818449922
 
 WORK_DIR   = "downloads"
-CHUNK_SIZE = 2 * 1024 * 1024
+CHUNK_SIZE = 512 * 1024
 PART_SIZE  = 1900 * 1024 * 1024
 UA         = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
 PROXIES    = {"http": "socks5h://127.0.0.1:40000", "https": "socks5h://127.0.0.1:40000"}
@@ -101,7 +101,7 @@ async def fast_upload(file_path, status_msg, fname):
     file_size   = os.path.getsize(file_path)
     total_parts = math.ceil(file_size / CHUNK_SIZE)
     file_id     = random.randint(0, 2**63)
-    sem         = asyncio.Semaphore(16)
+    sem = asyncio.Semaphore(32)  # 16 → 32
     last_update = 0
     done_parts  = 0
 
