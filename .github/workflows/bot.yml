@@ -25,10 +25,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Write session file
-        run: |
-          echo "${{ secrets.SESSION_FILE }}" | base64 -d > user_session.session
-
       - name: Run Bot
         env:
           TG_API_ID: "${{ secrets.TG_API_ID }}"
