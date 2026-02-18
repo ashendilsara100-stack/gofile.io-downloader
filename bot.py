@@ -13,7 +13,8 @@ STRING_SESSION = os.environ.get("STRING_SESSION", "")
 CHANNEL_ID     = -1003818449922
 
 WORK_DIR   = "downloads"
-CHUNK_SIZE = 2 * 1024 * 1024  # ✅ 512KB → 2MB (faster upload)
+CHUNK_SIZE = 2 * 1024 * 1024
+PART_SIZE  = 1900 * 1024 * 1024
 UA         = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
 PROXIES    = {"http": "socks5h://127.0.0.1:40000", "https": "socks5h://127.0.0.1:40000"}
 
@@ -100,7 +101,7 @@ async def fast_upload(file_path, status_msg, fname):
     file_size   = os.path.getsize(file_path)
     total_parts = math.ceil(file_size / CHUNK_SIZE)
     file_id     = random.randint(0, 2**63)
-    sem         = asyncio.Semaphore(16)  # ✅ 8 → 16 (more parallel chunks)
+    sem         = asyncio.Semaphore(16)
     last_update = 0
     done_parts  = 0
 
@@ -131,7 +132,7 @@ async def fast_upload(file_path, status_msg, fname):
                     await status_msg.edit(
                         f"⬆️ **Uploading:** `{fname}`\n\n"
                         f"[{'█'*int(pct/10)}{'░'*(10-int(pct/10))}] {pct}%\n"
-                        f"📤 {done_parts * CHUNK_SIZE // (1024**2)} MB / {file_size // (1024**2)} MB"
+                        f"📤 {min(done_parts * CHUNK_SIZE, file_size) // (1024**2)} MB / {file_size // (1024**2)} MB"
                     )
                 except:
                     pass
@@ -143,19 +144,20 @@ async def fast_upload(file_path, status_msg, fname):
 # ── Worker ────────────────────────────────────────────────────────────────
 
 async def process_job(url, status_msg):
-    path = ""
+    path  = ""
+    parts = []
     try:
         await status_msg.edit("🔍 **Analysing link...**")
         dl_url, fname, size, hdrs = resolve_gofile(url)
         path = os.path.join(WORK_DIR, fname)
 
+        # Download
         done, last_edit = 0, 0
-        # ✅ Download - Warp proxy use කරනවා (GoFile block bypass)
         with requests.get(dl_url, headers=hdrs, stream=True, timeout=300) as r:
             r.raise_for_status()
             total = int(r.headers.get("content-length", 0))
             with open(path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=4*1024*1024):  # ✅ 1MB → 4MB
+                for chunk in r.iter_content(chunk_size=4*1024*1024):
                     if chunk:
                         f.write(chunk)
                         done += len(chunk)
@@ -174,19 +176,48 @@ async def process_job(url, status_msg):
                                 pass
                             last_edit = now
 
-        input_file = await fast_upload(path, status_msg, fname)
+        # Split if > 1.9GB
+        file_size_raw = os.path.getsize(path)
+        if file_size_raw > PART_SIZE:
+            await status_msg.edit(f"✂️ **Splitting file...**")
+            print(f"✂️ Splitting {fname} into parts...")
+            with open(path, "rb") as f:
+                i = 1
+                while True:
+                    data = f.read(PART_SIZE)
+                    if not data:
+                        break
+                    pname = f"{path}.part{i}"
+                    with open(pname, "wb") as out:
+                        out.write(data)
+                    parts.append(pname)
+                    i += 1
+            os.remove(path)
+            path = ""
+        else:
+            parts = [path]
 
-        await user_client(SendMediaRequest(
-            peer=CHANNEL_ID,
-            media=InputMediaUploadedDocument(
-                file=input_file,
-                mime_type="application/octet-stream",
-                attributes=[DocumentAttributeFilename(fname)]
-            ),
-            message=f"✅ **{fname}**\n📦 {size//(1024**2)} MB",
-            random_id=random.randint(0, 2**63),
-        ))
-        await status_msg.edit(f"✅ **Done!** `{fname}` uploaded to channel.")
+        # Upload parts
+        total_parts_count = len(parts)
+        for i, p in enumerate(parts, 1):
+            pname_display = os.path.basename(p)
+            print(f"⬆️ Uploading part {i}/{total_parts_count}: {pname_display}")
+            input_file = await fast_upload(p, status_msg, pname_display)
+            await user_client(SendMediaRequest(
+                peer=CHANNEL_ID,
+                media=InputMediaUploadedDocument(
+                    file=input_file,
+                    mime_type="application/octet-stream",
+                    attributes=[DocumentAttributeFilename(pname_display)]
+                ),
+                message=f"✅ **{fname}**\n🗂 Part {i}/{total_parts_count}\n📦 {size//(1024**2)} MB",
+                random_id=random.randint(0, 2**63),
+            ))
+            if os.path.exists(p):
+                os.remove(p)
+            print(f"✅ Part {i}/{total_parts_count} uploaded.")
+
+        await status_msg.edit(f"✅ **Done!** `{fname}` uploaded! ({total_parts_count} part{'s' if total_parts_count > 1 else ''})")
 
     except Exception as e:
         print(f"❌ Error: {e}")
@@ -195,6 +226,10 @@ async def process_job(url, status_msg):
         if path and os.path.exists(path):
             try: os.remove(path)
             except: pass
+        for p in parts:
+            if os.path.exists(p):
+                try: os.remove(p)
+                except: pass
 
 async def worker():
     global worker_running
