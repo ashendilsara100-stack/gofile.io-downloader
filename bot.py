@@ -151,7 +151,7 @@ async def process_job(url, status_msg):
 
         done, last_edit = 0, 0
         # ✅ Download - Warp proxy use කරනවා (GoFile block bypass)
-        with requests.get(dl_url, headers=hdrs, proxies=PROXIES, stream=True, timeout=300) as r:
+        with requests.get(dl_url, headers=hdrs, stream=True, timeout=300) as r:
             r.raise_for_status()
             total = int(r.headers.get("content-length", 0))
             with open(path, "wb") as f:
