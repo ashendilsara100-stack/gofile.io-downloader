@@ -1,27 +1,25 @@
-import os
-import re
-import math
-import asyncio
-import time
-import requests
-import random
+import os, re, math, asyncio, time, requests, random
 from collections import deque
 from telethon import TelegramClient, events, helpers
 from telethon.sessions import StringSession
 from telethon.tl.functions.upload import SaveBigFilePartRequest
 
 # --- CONFIGURATION ---
-# මෙතන os.environ වෙනුවට ඔයාගේ values කෙලින්ම දාන්න (Hardcode)
 API_ID         = int(os.environ.get("TG_API_ID", 0)) 
 API_HASH       = os.environ.get("TG_API_HASH", "")
 BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
 STRING_SESSION = os.environ.get("STRING_SESSION", "")
 CHANNEL_ID     = -1003818449922 
 
+# Warp Proxy Settings (Cloudflare Warp needs to be running)
+PROXIES = {
+    "http": "socks5h://127.0.0.1:40000",
+    "https": "socks5h://127.0.0.1:40000"
+}
+
 WORK_DIR = "downloads"
 os.makedirs(WORK_DIR, exist_ok=True)
 
-# Clients
 user_client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 bot_client = TelegramClient("bot_session", API_ID, API_HASH)
 
@@ -56,8 +54,7 @@ async def fast_upload(client, file_path, status_msg, fname):
             now = time.time()
             if now - last_update > 5:
                 pct = (part_index / total_parts) * 100
-                try:
-                    await status_msg.edit(f"⬆️ **Fast Uploading:** `{fname}`\n\n[{'■'*int(pct/10)}{'□'*(10-int(pct/10))}] {pct:.1f}%")
+                try: await status_msg.edit(f"⬆️ **Fast Uploading:** `{fname}`\n\n[{'■'*int(pct/10)}{'□'*(10-int(pct/10))}] {pct:.1f}%")
                 except: pass
                 last_update = now
 
@@ -70,10 +67,12 @@ async def fast_upload(client, file_path, status_msg, fname):
     await asyncio.gather(*tasks)
     return helpers.create_input_file(file_id, total_parts, fname, file_size)
 
-# --- GOFILE LOGIC (UPDATED) ---
+# --- GOFILE LOGIC (WARP ENABLED & IMPROVED) ---
 def get_website_token():
     try:
-        r = requests.get("https://gofile.io/dist/js/config.js", timeout=10)
+        # User-agent එකක් නැතිව සමහරවිට config file එක දෙන්නේ නැහැ
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"}
+        r = requests.get("https://gofile.io/dist/js/config.js", proxies=PROXIES, headers=headers, timeout=15)
         m = re.search(r'websiteToken["\']?\s*[=:]\s*["\']([^"\']{4,})["\']', r.text)
         return m.group(1) if m else "none"
     except: return "none"
@@ -81,62 +80,75 @@ def get_website_token():
 def resolve_gofile(page_url):
     try:
         cid = page_url.rstrip("/").split("/d/")[-1]
+        sess = requests.Session()
+        sess.proxies.update(PROXIES) 
         
-        # Get Guest Token
-        acc = requests.post("https://api.gofile.io/accounts", timeout=10).json()
-        token = acc['data']['token']
+        # Browser එකක් ලෙස හැසිරීමට Headers එකතු කිරීම
+        sess.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+
+        # 1. Guest Account එකක් සාදා ගැනීම
+        acc_resp = sess.post("https://api.gofile.io/accounts", timeout=20).json()
+        if acc_resp.get("status") != "ok":
+            raise Exception("API blocked account creation.")
+        token = acc_resp['data']['token']
         
-        # Get Website Token
+        # 2. Website Token ලබා ගැනීම
         wt = get_website_token()
         headers = {
             "Authorization": f"Bearer {token}",
             "X-Website-Token": wt,
             "Origin": "https://gofile.io",
-            "Referer": "https://gofile.io/"
+            "Referer": f"https://gofile.io/d/{cid}"
         }
         
-        # Fetch Content
-        resp = requests.get(f"https://api.gofile.io/contents/{cid}?cache=true", headers=headers, timeout=15).json()
+        # 3. Content විස්තර ලබා ගැනීම
+        resp = sess.get(f"https://api.gofile.io/contents/{cid}?cache=true", headers=headers, timeout=25).json()
         
         if resp.get("status") != "ok":
-            raise Exception("Gofile API reported an error.")
+            status_info = resp.get("status", "Unknown Error")
+            raise Exception(f"Gofile API Error: {status_info}")
             
-        content_data = resp.get("data", {})
-        children = content_data.get("children", {})
+        data = resp.get("data", {})
+        children = data.get("children", {})
         
-        # Folder එකක් නම් ඒක ඇතුළේ තියෙන පළවෙනි file එක ගන්න
+        # Children හසුරුවන ආකාරය (Dict or List)
         item = None
-        if children:
+        if isinstance(children, dict):
             item = next((v for v in children.values() if v.get("type") == "file"), None)
-        elif content_data.get("type") == "file":
-            item = content_data
+        elif isinstance(children, list):
+            item = next((v for v in children if v.get("type") == "file"), None)
+        
+        # Folder එකක් නම් ඒක ඇතුළේ ඇති පළමු file එක
+        if not item and data.get("type") == "file":
+            item = data
             
         if not item:
-            raise Exception("No downloadable file found in this link.")
+            raise Exception("No file found. Link might be empty or password protected.")
             
         return item["link"], item["name"], item.get("size", 0), headers
     except Exception as e:
-        raise Exception(f"GoFile Error: {str(e)}")
+        raise Exception(f"Resolve Error: {str(e)}")
 
 # --- WORKER ---
 async def process_job(url, status_msg):
-    global worker_running
     path = ""
     try:
-        await status_msg.edit("🔍 Analysing Link...")
+        await status_msg.edit("🔍 **Analysing Link (via Warp)...**")
         dl_url, fname, size, hdrs = resolve_gofile(url)
         path = os.path.join(WORK_DIR, fname)
 
-        # Download
+        # Download via Warp Proxy
         await status_msg.edit(f"📥 **Downloading:** `{fname}`")
-        with requests.get(dl_url, headers=hdrs, stream=True, timeout=30) as r:
+        with requests.get(dl_url, headers=hdrs, stream=True, timeout=60, proxies=PROXIES) as r:
             r.raise_for_status()
             with open(path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=5*1024*1024):
+                for chunk in r.iter_content(chunk_size=5*1024*1024): # 5MB buffer
                     if chunk: f.write(chunk)
 
-        # Upload
-        await status_msg.edit(f"⬆️ **Uploading to Channel...**")
+        # Fast Upload to Telegram
         input_file = await fast_upload(user_client, path, status_msg, fname)
         
         await user_client.send_file(
@@ -150,7 +162,7 @@ async def process_job(url, status_msg):
     except Exception as e:
         await status_msg.edit(f"❌ **Error:** {str(e)}")
     finally:
-        if path and os.path.exists(path):
+        if path and os.path.exists(path): 
             try: os.remove(path)
             except: pass
 
@@ -166,30 +178,22 @@ async def worker():
 # --- COMMANDS ---
 @bot_client.on(events.NewMessage(pattern='/start'))
 async def start(event):
-    await event.respond("⚡ **High-Speed GoFile Bot Active!**\nSend a link to start.")
-
-@bot_client.on(events.NewMessage(pattern='/queue'))
-async def queue_status(event):
-    await event.respond(f"📋 **Queue Count:** {len(job_queue)}")
+    await event.respond("⚡ **Warp-Powered GoFile Bot Active!**\nSend link to start.")
 
 @bot_client.on(events.NewMessage(pattern=r"https://gofile\.io/d/\S+"))
 async def link_handler(event):
     global worker_running
     url = event.pattern_match.group(0).strip()
-    msg = await event.respond("⏳ Adding to Fast Queue...")
+    msg = await event.respond("⏳ Adding to Warp Queue...")
     job_queue.append((url, msg))
-    if not worker_running:
-        asyncio.create_task(worker())
+    if not worker_running: asyncio.create_task(worker())
 
 async def main():
-    print("🚀 Starting Bot...")
+    print("🚀 Connecting Clients...")
     await user_client.start()
     await bot_client.start(bot_token=BOT_TOKEN)
-    print("💎 Bot Online!")
-    await asyncio.gather(
-        user_client.run_until_disconnected(),
-        bot_client.run_until_disconnected()
-    )
+    print("💎 Bot Online with Warp Proxy!")
+    await asyncio.gather(user_client.run_until_disconnected(), bot_client.run_until_disconnected())
 
 if __name__ == "__main__":
     asyncio.run(main())
