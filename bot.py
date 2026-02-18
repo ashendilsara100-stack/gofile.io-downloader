@@ -101,18 +101,18 @@ async def fast_upload(file_path, status_msg, fname):
     file_size   = os.path.getsize(file_path)
     total_parts = math.ceil(file_size / CHUNK_SIZE)
     file_id     = random.randint(0, 2**63)
-    sem = asyncio.Semaphore(32)  # 16 → 32
+    sem         = asyncio.Semaphore(32)
     last_update = 0
     done_parts  = 0
 
-    chunks = []
-    with open(file_path, "rb") as f:
-        for i in range(total_parts):
-            chunks.append((i, f.read(CHUNK_SIZE)))
-
-    async def upload_one(idx, data):
+    async def upload_one(idx):
         nonlocal last_update, done_parts
         async with sem:
+            # ✅ RAM save - chunk එකින් එකට read කරන්න
+            with open(file_path, "rb") as f:
+                f.seek(idx * CHUNK_SIZE)
+                data = f.read(CHUNK_SIZE)
+
             for attempt in range(10):
                 try:
                     await user_client(SaveBigFilePartRequest(
@@ -138,7 +138,7 @@ async def fast_upload(file_path, status_msg, fname):
                     pass
                 last_update = now
 
-    await asyncio.gather(*[upload_one(i, d) for i, d in chunks])
+    await asyncio.gather(*[upload_one(i) for i in range(total_parts)])
     return InputFileBig(id=file_id, parts=total_parts, name=fname)
 
 # ── Worker ────────────────────────────────────────────────────────────────
@@ -149,7 +149,6 @@ async def process_job(url, status_msg):
         await status_msg.edit("🔍 **Analysing link...**")
         dl_url, fname, size, hdrs = resolve_gofile(url)
 
-        # ✅ Stream download + split directly (disk space save, no kill)
         downloaded = 0
         total      = size
         part_num   = 1
@@ -180,24 +179,25 @@ async def process_job(url, status_msg):
                             pass
                         last_edit = now
 
-                    # ✅ Part size hit වුණාම disk write කරලා buf clear කරන්න
                     while len(buf) >= PART_SIZE:
                         pname = os.path.join(WORK_DIR, f"{fname}.part{part_num}")
                         with open(pname, "wb") as f:
                             f.write(buf[:PART_SIZE])
                         parts.append(pname)
+                        print(f"✂️ Part {part_num} saved: {pname}")
                         buf = buf[PART_SIZE:]
                         part_num += 1
 
-            # Remaining data
             if buf:
                 pname = os.path.join(WORK_DIR, f"{fname}.part{part_num}")
                 with open(pname, "wb") as f:
                     f.write(buf)
                 parts.append(pname)
+                print(f"✂️ Part {part_num} saved: {pname}")
 
-        # Upload parts
         total_parts_count = len(parts)
+        print(f"📦 Total: {total//(1024**2)} MB → {total_parts_count} parts")
+
         for i, p in enumerate(parts, 1):
             pname_display = os.path.basename(p)
             print(f"⬆️ Uploading part {i}/{total_parts_count}: {pname_display}")
