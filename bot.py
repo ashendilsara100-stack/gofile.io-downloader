@@ -144,58 +144,57 @@ async def fast_upload(file_path, status_msg, fname):
 # ── Worker ────────────────────────────────────────────────────────────────
 
 async def process_job(url, status_msg):
-    path  = ""
     parts = []
     try:
         await status_msg.edit("🔍 **Analysing link...**")
         dl_url, fname, size, hdrs = resolve_gofile(url)
-        path = os.path.join(WORK_DIR, fname)
 
-        # Download
-        done, last_edit = 0, 0
+        # ✅ Stream download + split directly (disk space save, no kill)
+        downloaded = 0
+        total      = size
+        part_num   = 1
+        buf        = b""
+        last_edit  = 0
+
         with requests.get(dl_url, headers=hdrs, stream=True, timeout=300) as r:
             r.raise_for_status()
-            total = int(r.headers.get("content-length", 0))
-            with open(path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=4*1024*1024):
-                    if chunk:
-                        f.write(chunk)
-                        done += len(chunk)
-                        now = time.time()
-                        if total and now - last_edit > 5:
-                            pct = int(done / total * 100)
-                            spd = done / (now - last_edit + 0.001) / (1024*1024)
-                            try:
-                                await status_msg.edit(
-                                    f"⬇️ **Downloading:** `{fname}`\n\n"
-                                    f"[{'█'*int(pct/10)}{'░'*(10-int(pct/10))}] {pct}%\n"
-                                    f"📦 {done//(1024**2)} MB / {total//(1024**2)} MB\n"
-                                    f"⚡ {spd:.1f} MB/s"
-                                )
-                            except:
-                                pass
-                            last_edit = now
+            total = int(r.headers.get("content-length", total))
 
-        # Split if > 1.9GB
-        file_size_raw = os.path.getsize(path)
-        if file_size_raw > PART_SIZE:
-            await status_msg.edit(f"✂️ **Splitting file...**")
-            print(f"✂️ Splitting {fname} into parts...")
-            with open(path, "rb") as f:
-                i = 1
-                while True:
-                    data = f.read(PART_SIZE)
-                    if not data:
-                        break
-                    pname = f"{path}.part{i}"
-                    with open(pname, "wb") as out:
-                        out.write(data)
-                    parts.append(pname)
-                    i += 1
-            os.remove(path)
-            path = ""
-        else:
-            parts = [path]
+            for chunk in r.iter_content(chunk_size=4*1024*1024):
+                if chunk:
+                    buf        += chunk
+                    downloaded += len(chunk)
+
+                    now = time.time()
+                    if now - last_edit > 5:
+                        pct = int(downloaded / total * 100)
+                        spd = downloaded / (now - last_edit + 0.001) / (1024*1024)
+                        try:
+                            await status_msg.edit(
+                                f"⬇️ **Downloading:** `{fname}`\n\n"
+                                f"[{'█'*int(pct/10)}{'░'*(10-int(pct/10))}] {pct}%\n"
+                                f"📦 {downloaded//(1024**2)} MB / {total//(1024**2)} MB\n"
+                                f"⚡ {spd:.1f} MB/s"
+                            )
+                        except:
+                            pass
+                        last_edit = now
+
+                    # ✅ Part size hit වුණාම disk write කරලා buf clear කරන්න
+                    while len(buf) >= PART_SIZE:
+                        pname = os.path.join(WORK_DIR, f"{fname}.part{part_num}")
+                        with open(pname, "wb") as f:
+                            f.write(buf[:PART_SIZE])
+                        parts.append(pname)
+                        buf = buf[PART_SIZE:]
+                        part_num += 1
+
+            # Remaining data
+            if buf:
+                pname = os.path.join(WORK_DIR, f"{fname}.part{part_num}")
+                with open(pname, "wb") as f:
+                    f.write(buf)
+                parts.append(pname)
 
         # Upload parts
         total_parts_count = len(parts)
@@ -223,9 +222,6 @@ async def process_job(url, status_msg):
         print(f"❌ Error: {e}")
         await status_msg.edit(f"❌ **Error:** {e}")
     finally:
-        if path and os.path.exists(path):
-            try: os.remove(path)
-            except: pass
         for p in parts:
             if os.path.exists(p):
                 try: os.remove(p)
