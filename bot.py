@@ -1,5 +1,6 @@
 import os
 import re
+import math
 import asyncio
 import time
 import requests
@@ -10,10 +11,11 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.upload import SaveBigFilePartRequest
 
 # --- CONFIGURATION ---
-API_ID         = int(os.environ["TG_API_ID"])
-API_HASH       = os.environ["TG_API_HASH"]
-BOT_TOKEN      = os.environ["BOT_TOKEN"]
-STRING_SESSION = os.environ.get("STRING_SESSION")
+# මෙතන os.environ වෙනුවට ඔයාගේ values කෙලින්ම දාන්න (Hardcode)
+API_ID         = int(os.environ.get("TG_API_ID", 0)) 
+API_HASH       = os.environ.get("TG_API_HASH", "")
+BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
+STRING_SESSION = os.environ.get("STRING_SESSION", "")
 CHANNEL_ID     = -1003818449922 
 
 WORK_DIR = "downloads"
@@ -29,12 +31,10 @@ worker_running = False
 # --- SPEED OPTIMIZED UPLOADER ---
 async def fast_upload(client, file_path, status_msg, fname):
     file_size = os.path.getsize(file_path)
-    # Chunks size (512KB for big files is standard)
     chunk_size = 512 * 1024
     total_parts = math.ceil(file_size / chunk_size)
     file_id = random.randint(0, 2**63)
     
-    # Concurrent connections (Max 8 is safe for Oracle)
     semaphore = asyncio.Semaphore(8)
     last_update = 0
 
@@ -53,11 +53,12 @@ async def fast_upload(client, file_path, status_msg, fname):
                 except Exception:
                     await asyncio.sleep(2)
             
-            # Update Progress every 5 seconds
             now = time.time()
             if now - last_update > 5:
                 pct = (part_index / total_parts) * 100
-                await status_msg.edit(f"⬆️ **Fast Uploading:** `{fname}`\n\n[{'■'*int(pct/10)}{'□'*(10-int(pct/10))}] {pct:.1f}%")
+                try:
+                    await status_msg.edit(f"⬆️ **Fast Uploading:** `{fname}`\n\n[{'■'*int(pct/10)}{'□'*(10-int(pct/10))}] {pct:.1f}%")
+                except: pass
                 last_update = now
 
     tasks = []
@@ -69,34 +70,64 @@ async def fast_upload(client, file_path, status_msg, fname):
     await asyncio.gather(*tasks)
     return helpers.create_input_file(file_id, total_parts, fname, file_size)
 
-# --- GOFILE LOGIC ---
+# --- GOFILE LOGIC (UPDATED) ---
 def get_website_token():
     try:
-        r = requests.get("https://gofile.io/dist/js/config.js", timeout=15)
+        r = requests.get("https://gofile.io/dist/js/config.js", timeout=10)
         m = re.search(r'websiteToken["\']?\s*[=:]\s*["\']([^"\']{4,})["\']', r.text)
         return m.group(1) if m else "none"
     except: return "none"
 
 def resolve_gofile(page_url):
-    cid = page_url.rstrip("/").split("/d/")[-1]
-    r = requests.post("https://api.gofile.io/accounts", timeout=15).json()
-    token = r['data']['token']
-    wt = get_website_token()
-    headers = {"Authorization": f"Bearer {token}", "X-Website-Token": wt}
-    resp = requests.get(f"https://api.gofile.io/contents/{cid}?cache=true", headers=headers, timeout=20).json()
-    if resp.get("status") != "ok": raise Exception("Link is invalid.")
-    item = next((v for v in resp["data"].get("children", {}).values() if v.get("type") == "file"), resp["data"])
-    return item["link"], item["name"], item.get("size", 0), headers
+    try:
+        cid = page_url.rstrip("/").split("/d/")[-1]
+        
+        # Get Guest Token
+        acc = requests.post("https://api.gofile.io/accounts", timeout=10).json()
+        token = acc['data']['token']
+        
+        # Get Website Token
+        wt = get_website_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Website-Token": wt,
+            "Origin": "https://gofile.io",
+            "Referer": "https://gofile.io/"
+        }
+        
+        # Fetch Content
+        resp = requests.get(f"https://api.gofile.io/contents/{cid}?cache=true", headers=headers, timeout=15).json()
+        
+        if resp.get("status") != "ok":
+            raise Exception("Gofile API reported an error.")
+            
+        content_data = resp.get("data", {})
+        children = content_data.get("children", {})
+        
+        # Folder එකක් නම් ඒක ඇතුළේ තියෙන පළවෙනි file එක ගන්න
+        item = None
+        if children:
+            item = next((v for v in children.values() if v.get("type") == "file"), None)
+        elif content_data.get("type") == "file":
+            item = content_data
+            
+        if not item:
+            raise Exception("No downloadable file found in this link.")
+            
+        return item["link"], item["name"], item.get("size", 0), headers
+    except Exception as e:
+        raise Exception(f"GoFile Error: {str(e)}")
 
 # --- WORKER ---
 async def process_job(url, status_msg):
+    global worker_running
     path = ""
     try:
         await status_msg.edit("🔍 Analysing Link...")
         dl_url, fname, size, hdrs = resolve_gofile(url)
         path = os.path.join(WORK_DIR, fname)
 
-        # Download with larger buffer (5MB)
+        # Download
         await status_msg.edit(f"📥 **Downloading:** `{fname}`")
         with requests.get(dl_url, headers=hdrs, stream=True, timeout=30) as r:
             r.raise_for_status()
@@ -104,7 +135,8 @@ async def process_job(url, status_msg):
                 for chunk in r.iter_content(chunk_size=5*1024*1024):
                     if chunk: f.write(chunk)
 
-        # Parallel Upload
+        # Upload
+        await status_msg.edit(f"⬆️ **Uploading to Channel...**")
         input_file = await fast_upload(user_client, path, status_msg, fname)
         
         await user_client.send_file(
@@ -118,7 +150,9 @@ async def process_job(url, status_msg):
     except Exception as e:
         await status_msg.edit(f"❌ **Error:** {str(e)}")
     finally:
-        if path and os.path.exists(path): os.remove(path)
+        if path and os.path.exists(path):
+            try: os.remove(path)
+            except: pass
 
 async def worker():
     global worker_running
@@ -126,12 +160,13 @@ async def worker():
         worker_running = True
         url, msg = job_queue.popleft()
         await process_job(url, msg)
+        await asyncio.sleep(2)
     worker_running = False
 
 # --- COMMANDS ---
 @bot_client.on(events.NewMessage(pattern='/start'))
 async def start(event):
-    await event.respond("⚡ **High-Speed GoFile Bot Active!**\nSend link to start.")
+    await event.respond("⚡ **High-Speed GoFile Bot Active!**\nSend a link to start.")
 
 @bot_client.on(events.NewMessage(pattern='/queue'))
 async def queue_status(event):
@@ -143,13 +178,18 @@ async def link_handler(event):
     url = event.pattern_match.group(0).strip()
     msg = await event.respond("⏳ Adding to Fast Queue...")
     job_queue.append((url, msg))
-    if not worker_running: asyncio.create_task(worker())
+    if not worker_running:
+        asyncio.create_task(worker())
 
 async def main():
+    print("🚀 Starting Bot...")
     await user_client.start()
     await bot_client.start(bot_token=BOT_TOKEN)
-    await asyncio.gather(user_client.run_until_disconnected(), bot_client.run_until_disconnected())
+    print("💎 Bot Online!")
+    await asyncio.gather(
+        user_client.run_until_disconnected(),
+        bot_client.run_until_disconnected()
+    )
 
 if __name__ == "__main__":
-    import math
     asyncio.run(main())
