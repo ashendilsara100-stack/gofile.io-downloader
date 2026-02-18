@@ -26,30 +26,14 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Write session file
-        run: echo "${{ secrets.SESSION_FILE }}" | base64 -d > user_session.session
+        run: |
+          echo "${{ secrets.SESSION_FILE }}" | base64 -d > user_session.session
 
       - name: Run Bot
         env:
-          TG_API_ID: ${{ secrets.TG_API_ID }}
-          TG_API_HASH: ${{ secrets.TG_API_HASH }}
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          OWNER_ID: ${{ secrets.OWNER_ID }}
-          STRING_SESSION: ${{ secrets.STRING_SESSION }}
+          TG_API_ID: "${{ secrets.TG_API_ID }}"
+          TG_API_HASH: "${{ secrets.TG_API_HASH }}"
+          BOT_TOKEN: "${{ secrets.BOT_TOKEN }}"
+          OWNER_ID: "${{ secrets.OWNER_ID }}"
+          STRING_SESSION: "${{ secrets.STRING_SESSION }}"
         run: python bot.py
-```
-
----
-
-**`bot.py`** (python file - repo root එකේ):
-> Previous message එකේ දුන්න full Python code එක මෙතට paste කරන්න.
-
----
-
-**File structure:**
-```
-your-repo/
-├── .github/
-│   └── workflows/
-│       └── bot.yml      ← YAML only
-├── bot.py               ← Python only
-└── requirements.txt
