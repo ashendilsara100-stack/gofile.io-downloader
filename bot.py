@@ -13,7 +13,7 @@ STRING_SESSION = os.environ.get("STRING_SESSION", "")
 CHANNEL_ID     = -1003818449922
 
 WORK_DIR   = "downloads"
-CHUNK_SIZE = 512 * 1024
+CHUNK_SIZE = 2 * 1024 * 1024  # ✅ 512KB → 2MB (faster upload)
 UA         = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
 PROXIES    = {"http": "socks5h://127.0.0.1:40000", "https": "socks5h://127.0.0.1:40000"}
 
@@ -100,8 +100,9 @@ async def fast_upload(file_path, status_msg, fname):
     file_size   = os.path.getsize(file_path)
     total_parts = math.ceil(file_size / CHUNK_SIZE)
     file_id     = random.randint(0, 2**63)
-    sem         = asyncio.Semaphore(8)
+    sem         = asyncio.Semaphore(16)  # ✅ 8 → 16 (more parallel chunks)
     last_update = 0
+    done_parts  = 0
 
     chunks = []
     with open(file_path, "rb") as f:
@@ -109,7 +110,7 @@ async def fast_upload(file_path, status_msg, fname):
             chunks.append((i, f.read(CHUNK_SIZE)))
 
     async def upload_one(idx, data):
-        nonlocal last_update
+        nonlocal last_update, done_parts
         async with sem:
             for attempt in range(10):
                 try:
@@ -117,6 +118,7 @@ async def fast_upload(file_path, status_msg, fname):
                         file_id=file_id, file_part=idx,
                         file_total_parts=total_parts, bytes=data
                     ))
+                    done_parts += 1
                     break
                 except Exception as e:
                     print(f"⚠️ Chunk {idx} attempt {attempt}: {e}")
@@ -124,11 +126,12 @@ async def fast_upload(file_path, status_msg, fname):
 
             now = time.time()
             if now - last_update > 5:
-                pct = int(idx / total_parts * 100)
+                pct = int(done_parts / total_parts * 100)
                 try:
                     await status_msg.edit(
                         f"⬆️ **Uploading:** `{fname}`\n\n"
-                        f"[{'█'*int(pct/10)}{'░'*(10-int(pct/10))}] {pct}%"
+                        f"[{'█'*int(pct/10)}{'░'*(10-int(pct/10))}] {pct}%\n"
+                        f"📤 {done_parts * CHUNK_SIZE // (1024**2)} MB / {file_size // (1024**2)} MB"
                     )
                 except:
                     pass
@@ -147,22 +150,25 @@ async def process_job(url, status_msg):
         path = os.path.join(WORK_DIR, fname)
 
         done, last_edit = 0, 0
-        with requests.get(dl_url, headers=hdrs, proxies=PROXIES, stream=True, timeout=120) as r:
+        # ✅ Download - Warp proxy use කරනවා (GoFile block bypass)
+        with requests.get(dl_url, headers=hdrs, proxies=PROXIES, stream=True, timeout=300) as r:
             r.raise_for_status()
             total = int(r.headers.get("content-length", 0))
             with open(path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024*1024):
+                for chunk in r.iter_content(chunk_size=4*1024*1024):  # ✅ 1MB → 4MB
                     if chunk:
                         f.write(chunk)
                         done += len(chunk)
                         now = time.time()
                         if total and now - last_edit > 5:
                             pct = int(done / total * 100)
+                            spd = done / (now - last_edit + 0.001) / (1024*1024)
                             try:
                                 await status_msg.edit(
                                     f"⬇️ **Downloading:** `{fname}`\n\n"
                                     f"[{'█'*int(pct/10)}{'░'*(10-int(pct/10))}] {pct}%\n"
-                                    f"📦 {done//(1024**2)} MB / {total//(1024**2)} MB"
+                                    f"📦 {done//(1024**2)} MB / {total//(1024**2)} MB\n"
+                                    f"⚡ {spd:.1f} MB/s"
                                 )
                             except:
                                 pass
